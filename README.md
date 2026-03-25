@@ -9,10 +9,37 @@ import shallowsim as sb
 
 args = sb.ModelArgs()
 c = sb.Config()
+
+# Option 1: keep same hardware list for decode (backward compatible)
 gpu_list = sb.get_gpu_info('./device/gpu_info.csv', 
-                            decoding_mode=True, print_console=True) 
+                            decoding_mode=True, print_console=True)
 
 dfs = sb.decode_time_with_ep_list(args,gpu_list,c,print_console=False,fp8_combine=True)
+```
+
+## Use Different Hardware For Prefill And Decode
+
+```python
+import shallowsim as sb
+
+args = sb.ModelArgs()
+c = sb.Config()
+
+# Configure hardware independently by stage
+c.prefill_gpu_info_file = './device/gpu_info.csv'
+c.decode_gpu_info_file = './device/gpu_info.csv'
+c.prefill_device_list = ['GB200-NVL72']
+c.decode_device_list = ['GB300-NVL72', 'B200-SXM']
+
+gpu_prefill, gpu_decode = sb.get_stage_gpu_info(c, print_console=False)
+
+# Prefill uses prefill hardware set
+prefill_detail, prefill_summary = sb.prefill_time(
+    args, gpu_prefill, c.seq_len, c.kv_cache_rate, tp=4, dp=8)
+
+# Decode uses decode hardware set
+decode_df = sb.decode_time_with_ep_list(
+    args, gpu_decode, c, print_console=False, fp8_combine=True)
 ```
 ## Summary Report 
 

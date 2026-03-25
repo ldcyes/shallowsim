@@ -23,6 +23,8 @@ class ModelArgs:
     n_layers: int = 61
     n_dense_layers: int = 3
     n_heads: int = 128
+    n_kv_heads: int = 1
+    bpe: int = 1
     # moe
     n_routed_experts: int = 256
     n_shared_experts: int = 1
@@ -43,6 +45,94 @@ class ModelArgs:
     beta_fast: int = 32
     beta_slow: int = 1
     mscale: float = 1.
+    attn_type: str = 'MLA'
+
+
+MODEL_ARG_FIELDS = [
+    'max_batch_size', 'max_seq_len', 'vocab_size', 'dim', 'inter_dim',
+    'moe_inter_dim', 'n_layers', 'n_dense_layers', 'n_heads', 'n_kv_heads', 'bpe',
+    'n_routed_experts', 'n_shared_experts', 'n_activated_experts',
+    'n_expert_groups', 'n_limited_groups', 'route_scale', 'q_lora_rank',
+    'kv_lora_rank', 'qk_nope_head_dim', 'qk_rope_head_dim', 'v_head_dim',
+    'original_seq_len', 'rope_theta', 'rope_factor', 'beta_fast',
+    'beta_slow', 'mscale', 'attn_type'
+]
+
+
+MODEL_FIELD_ALIASES = {
+    'model_name': ['model_name', 'model'],
+    'n_layers': ['n_layers', 'layer'],
+    'n_heads': ['n_heads', 'head'],
+    'n_kv_heads': ['n_kv_heads', 'kv_head', 'kv head'],
+    'dim': ['dim', 'hidden'],
+    'q_lora_rank': ['q_lora_rank', 'q_lora'],
+    'kv_lora_rank': ['kv_lora_rank', 'kv_lora'],
+    'bpe': ['bpe'],
+    'moe_inter_dim': ['moe_inter_dim', 'moe_intermediate', 'moe intermediate'],
+    'n_activated_experts': ['n_activated_experts', 'top_k', 'top-k'],
+    'n_routed_experts': ['n_routed_experts', 'expert'],
+    'vocab_size': ['vocab_size', 'vocabulary', 'vacabulary'],
+    'attn_type': ['attn_type', 'attention', 'attention_type'],
+}
+
+
+def _get_row_value(row, field):
+    aliases = MODEL_FIELD_ALIASES.get(field, [field])
+    for alias in aliases:
+        if alias in row.index and not pd.isna(row[alias]):
+            return row[alias]
+    return None
+
+
+def _build_model_args_from_row(row):
+    args = ModelArgs()
+    for field in MODEL_ARG_FIELDS:
+        default_value = getattr(args, field)
+        value = _get_row_value(row, field)
+        if value is None:
+            continue
+        if isinstance(default_value, int):
+            setattr(args, field, int(value))
+        elif isinstance(default_value, float):
+            setattr(args, field, float(value))
+        else:
+            setattr(args, field, value)
+    return args
+
+
+def get_model_args(filename='./model.csv',
+                   model_name='DeepSeek-V3',
+                   print_console=False):
+    """Load one model config from CSV into ModelArgs."""
+    df = pd.read_csv(filename)
+    if print_console:
+        name_col = 'model_name' if 'model_name' in df.columns else 'model'
+        print(df.set_index(name_col).to_markdown())
+    name_col = 'model_name' if 'model_name' in df.columns else 'model'
+    model_df = df[df[name_col] == model_name]
+    if model_df.empty:
+        raise KeyError(f'Model {model_name} not found in {filename}')
+    return _build_model_args_from_row(model_df.iloc[0])
+
+
+def get_model_args_dict(filename='./model.csv',
+                        model_list=None,
+                        print_console=False):
+    """Load multiple model configs from CSV."""
+    if model_list is None:
+        model_list = []
+    df = pd.read_csv(filename)
+    if print_console:
+        name_col = 'model_name' if 'model_name' in df.columns else 'model'
+        print(df.set_index(name_col).to_markdown())
+    model_dict = {}
+    name_col = 'model_name' if 'model_name' in df.columns else 'model'
+    for _, row in df.iterrows():
+        model_name = row[name_col]
+        if model_list and model_name not in model_list:
+            continue
+        model_dict[model_name] = _build_model_args_from_row(row)
+    return model_dict
 
 
 class Config:
@@ -52,6 +142,13 @@ class Config:
     decode_len = 1210
     bs_list = [16, 32, 64, 128, 256, 512]
     eplist = [8, 16, 36, 72, 144, 320]
+    # Hardware profiles can now be configured independently for prefill/decode.
+    prefill_gpu_info_file = './device/gpu_info.csv'
+    decode_gpu_info_file = './device/gpu_info.csv'
+    prefill_device_list = []
+    decode_device_list = []
+    prefill_discount_rate = 0.85
+    decode_discount_rate = 0.85
 
 
 class GPU_perf:
@@ -130,6 +227,32 @@ def get_gpu_info(filename='./device/gpuinfo.csv',
             gpu_dict[key] = gpu
     return gpu_dict
 
+
+def get_stage_gpu_info(config: Config, print_console=False):
+    """Load prefill/decode GPU profiles independently.
+
+    This keeps backward compatibility with existing APIs while enabling
+    stage-specific hardware selection from a single Config object.
+
+    Returns:
+        Tuple[dict{GPU_perf}, dict{GPU_perf}]: (prefill_gpu_dict, decode_gpu_dict)
+    """
+    prefill_gpu_dict = get_gpu_info(
+        filename=getattr(config, 'prefill_gpu_info_file', './device/gpu_info.csv'),
+        discount_rate=getattr(config, 'prefill_discount_rate', 0.85),
+        device_list=getattr(config, 'prefill_device_list', []),
+        decoding_mode=False,
+        print_console=print_console)
+
+    decode_gpu_dict = get_gpu_info(
+        filename=getattr(config, 'decode_gpu_info_file', './device/gpu_info.csv'),
+        discount_rate=getattr(config, 'decode_discount_rate', 0.85),
+        device_list=getattr(config, 'decode_device_list', []),
+        decoding_mode=True,
+        print_console=print_console)
+
+    return prefill_gpu_dict, decode_gpu_dict
+
 def gpu_category_idx(gpu_dict):
     gpu_category={}
     i = 0
@@ -139,6 +262,134 @@ def gpu_category_idx(gpu_dict):
     return gpu_category
 
 # 非吸收的版本
+
+
+def is_gqa_model(args: ModelArgs):
+    return getattr(args, 'attn_type', 'MLA').upper() == 'GQA'
+
+
+def gqa_head_dim(args: ModelArgs):
+    return args.qk_nope_head_dim + args.qk_rope_head_dim
+
+
+def gqa_kv_cache_dim(args: ModelArgs):
+    return args.n_kv_heads * (gqa_head_dim(args) + args.v_head_dim)
+
+
+def gqa_flops(q_len, kv_len, args: ModelArgs, kv_cache_rate):
+    q_proj = q_len * args.dim * args.n_heads * gqa_head_dim(args)
+    k_proj = kv_len * args.dim * args.n_kv_heads * gqa_head_dim(args)
+    v_proj = kv_len * args.dim * args.n_kv_heads * args.v_head_dim
+    o_proj = q_len * args.n_heads * args.v_head_dim * args.dim
+
+    k_proj = k_proj * (1 - kv_cache_rate)
+    v_proj = v_proj * (1 - kv_cache_rate)
+    gemm_sum = q_proj + k_proj + v_proj + o_proj
+
+    attn_sum = args.n_heads * (
+        q_len * gqa_head_dim(args) * kv_len +
+        q_len * kv_len * args.v_head_dim)
+
+    gemm_sum = gemm_sum * 2 / 1e9
+    attn_sum = attn_sum * 2 / 1e9
+    return gemm_sum + attn_sum, gemm_sum, attn_sum
+
+
+def gqa_mem(args: ModelArgs):
+    q_proj = args.dim * args.n_heads * gqa_head_dim(args)
+    k_proj = args.dim * args.n_kv_heads * gqa_head_dim(args)
+    v_proj = args.dim * args.n_kv_heads * args.v_head_dim
+    o_proj = args.n_heads * args.v_head_dim * args.dim
+    return (q_proj + k_proj + v_proj + o_proj) / 1024 / 1024
+
+
+def gqa_elapse_time(args: ModelArgs,
+                    gpu: GPU_perf,
+                    seq_len,
+                    kv_cache_rate,
+                    tp=[2, 4, 8, 16, 32],
+                    decoding_mode=True,
+                    batchsize=1,
+                    enable_gemm_fp4=True,
+                    min_ar_time=0.015,
+                    gqa_discount=0.7,
+                    gqa_kernel_static_time=0.05,
+                    print_console=False):
+    if decoding_mode:
+        _, gemm_flops, attn_fp16_flops = gqa_flops(1, seq_len, args, 1)
+        gemm_flops *= batchsize
+        attn_fp16_flops *= batchsize
+    else:
+        _, gemm_flops, attn_fp16_flops = gqa_flops(seq_len, seq_len, args, kv_cache_rate)
+
+    gemm_fp8_t = gemm_flops / gpu.get_fp8_flops() / gqa_discount
+    attn_fp16_t = attn_fp16_flops / gpu.get_fp16_flops() / gqa_discount
+    load_t = gqa_mem(args) / gpu.get_mem_bw()
+
+    total = gemm_fp8_t + attn_fp16_t + load_t
+    if enable_gemm_fp4 and gpu.get_fp4_flops() != 0:
+        gemm_fp4_t = gemm_flops / gpu.get_fp4_flops()
+        total = gemm_fp4_t + attn_fp16_t
+
+    ar_len = batchsize if decoding_mode else seq_len
+    all_reduce_comm_size = ar_len * args.dim * 2 / 1024 / 1024
+    all_reduce_t = all_reduce_comm_size / gpu.get_nvlink_bw() + min_ar_time
+
+    tp_time = {}
+    for v in tp:
+        if v == 1:
+            tp_time[v] = total + gqa_kernel_static_time
+        else:
+            tp_time[v] = total / v + all_reduce_t + gqa_kernel_static_time
+
+    if print_console:
+        print("[%8s]GQA_GEMM_FP8 Elapsed time(ms): %.3f" %
+              (gpu.gpu_type, gemm_fp8_t))
+        print("[%8s]GQA_ATTN_FP16 Elapsed time(ms): %.3f" %
+              (gpu.gpu_type, attn_fp16_t))
+    return total, tp_time
+
+
+def attn_mem(args: ModelArgs):
+    if is_gqa_model(args):
+        return gqa_mem(args)
+    return mla_mem(args)
+
+
+def attn_kv_cache_dim(args: ModelArgs):
+    if is_gqa_model(args):
+        return gqa_kv_cache_dim(args)
+    return args.kv_lora_rank + args.qk_rope_head_dim
+
+
+def decode_kv_cache_storage_multiplier(args: ModelArgs, tp):
+    if is_gqa_model(args):
+        return 1
+    return tp
+
+
+def decode_kv_cache_load_divisor(args: ModelArgs, tp):
+    if is_gqa_model(args):
+        return max(1, tp)
+    return 1
+
+
+def decode_kv_cache_bytes(args: ModelArgs, seq_len, decode_len, tp):
+    token_num = seq_len + decode_len
+    kv_dim = attn_kv_cache_dim(args)
+    return token_num * kv_dim * args.n_layers * decode_kv_cache_storage_multiplier(args, tp)
+
+
+def decode_kv_load_time(args: ModelArgs, gpu: GPU_perf, seq_len, batchsize, tp):
+    kv_cache = seq_len * attn_kv_cache_dim(args) * batchsize
+    kv_cache = kv_cache / decode_kv_cache_load_divisor(args, tp)
+    return kv_cache / 1024 / 1024 / 1024 / gpu.get_mem_bw() * 1000
+
+
+def attn_elapse_time(args: ModelArgs, *func_args, **func_kwargs):
+    if is_gqa_model(args):
+        return gqa_elapse_time(args, *func_args, **func_kwargs)
+    return mla_elapse_time(args, *func_args, **func_kwargs)
 
 
 def mla_flops(q_len, kv_len, args: ModelArgs, kv_cache_rate):
@@ -293,6 +544,21 @@ def prefill_mla(args: ModelArgs, gpu_dict, seq_len, kv_cache_rate, print_console
     return df
 
 
+def prefill_gqa(args: ModelArgs, gpu_dict, seq_len, kv_cache_rate, print_console=False):
+    df = pd.DataFrame(columns=['GPU', 'TP1', 'TP4', 'TP8'])
+    for key in gpu_dict.keys():
+        tp1, tp_list = gqa_elapse_time(args, gpu_dict[key],
+                                       seq_len, kv_cache_rate,
+                                       tp=[4, 8],
+                                       decoding_mode=False,
+                                       enable_gemm_fp4=True,
+                                       print_console=print_console)
+        df.loc[len(df)] = [gpu_dict[key].gpu_type, tp1] + list(tp_list.values())
+    if print_console:
+        print(df.set_index('GPU').to_markdown(floatfmt='.3f'))
+    return df
+
+
 def densmlp_flops(args: ModelArgs, seq_len):
     return 3 * seq_len * args.dim * args.inter_dim * 2/1e9
 
@@ -405,11 +671,11 @@ def prefill_alltoall(args: ModelArgs, gpu_dict, seq_len, print_console=False):
 
 
 def _prefill_time(args: ModelArgs, gpu, seq_len, kv_cache_rate, tp, dp):
-    dense_mla, tp_mla = mla_elapse_time(args, gpu,
-                                        seq_len, kv_cache_rate,
-                                        tp=[tp],
-                                        decoding_mode=False,
-                                        enable_gemm_fp4=True)
+    dense_mla, tp_mla = attn_elapse_time(args, gpu,
+                                         seq_len, kv_cache_rate,
+                                         tp=[tp],
+                                         decoding_mode=False,
+                                         enable_gemm_fp4=True)
     dense_mlp = _prefill_dense_mlp(args, gpu, seq_len)
     shared, routed = _prefill_moe(args, gpu, seq_len, tp, dp)
     dispatch, combine = _prefill_alltoall(args, gpu, seq_len, tp)
@@ -452,17 +718,61 @@ def prefill_time(args: ModelArgs, gpu_dict, seq_len, kv_cache_rate, tp, dp, prin
 # Decoding
 
 
+def decode_other_parameter_gb(args: ModelArgs):
+    """Estimate non-attention, non-expert resident parameters in GB.
+
+    This includes:
+    - token embedding and LM head
+    - dense MLP weights in dense layers
+    - router/gate weights in sparse layers
+    - normalization weights
+    """
+    sparse_layer_num = args.n_layers - args.n_dense_layers
+    embedding_and_head_gb = 2 * args.vocab_size * args.dim / 1024 / 1024 / 1024
+    dense_mlp_gb = densmlp_mem(args) * args.n_dense_layers / 1024
+    router_gb = sparse_layer_num * args.dim * args.n_routed_experts / 1024 / 1024 / 1024
+    norm_gb = ((2 * args.n_layers) + 1) * args.dim / 1024 / 1024 / 1024
+    return embedding_and_head_gb + dense_mlp_gb + router_gb + norm_gb
+
+
 def _decoding_batchsize(args: ModelArgs, gpu: GPU_perf, seq_len, decode_len, tp, expert_num):
     mem_util_rate = 0.9  # torch/activation等其它开销的折扣
-    mla = 187.17  # MLA的参数(单位M)
-    expert_mem = 44.05  # expert的参数(单位M)
-    others_parameter = 2.91  # 其它参数2.91GB
-    kv_cache = (seq_len+decode_len) * (args.kv_lora_rank +
-                                       args.qk_rope_head_dim) * args.n_layers * tp
-    mem = gpu.mem * mem_util_rate - others_parameter - mla * args.n_layers/tp/1024
+    attn_param = attn_mem(args)
+    expert_mem = moe_expert_mem(args)  # expert参数，单位MB
+    others_parameter = decode_other_parameter_gb(args)
+    kv_cache = decode_kv_cache_bytes(args, seq_len, decode_len, tp)
+    mem = gpu.mem * mem_util_rate - others_parameter - attn_param * args.n_layers / tp / 1024
     mem -= expert_mem * \
         (args.n_layers - args.n_dense_layers) * expert_num / 1024
     return mem * 1024 * 1024 * 1024 / kv_cache
+
+
+def decode_ffn_weight_gb(args: ModelArgs):
+    dense_mlp_gb = densmlp_mem(args) * args.n_dense_layers / 1024
+    sparse_layer_num = args.n_layers - args.n_dense_layers
+    moe_expert_gb = moe_expert_mem(args) * sparse_layer_num * \
+        (args.n_shared_experts + args.n_routed_experts) / 1024
+    return dense_mlp_gb + moe_expert_gb
+
+
+def min_cabinet_count_for_decode_ffn(args: ModelArgs,
+                                     gpu: GPU_perf,
+                                     weight_util_rate=0.9):
+    cabinet_mem_gb = gpu.mem * gpu.gpu_per_node * weight_util_rate
+    return max(1, math.ceil(decode_ffn_weight_gb(args) / cabinet_mem_gb))
+
+
+def inter_stage_link_time(bs,
+                          args: ModelArgs,
+                          tp,
+                          link_bw=100,
+                          link_latency=0.005,
+                          max_link_rails=8):
+    activation_mb = bs * args.dim * 2 / 1024 / 1024
+    rail_num = max(1, min(tp, max_link_rails))
+    effective_bw = link_bw * rail_num
+    one_way = activation_mb / effective_bw
+    return 2 * (one_way + link_latency)
 
 
 def decode_batchsize(args: ModelArgs, gpu_dict, seq_len, decode_len, tp):
@@ -479,16 +789,16 @@ def decode_batchsize(args: ModelArgs, gpu_dict, seq_len, decode_len, tp):
     return df
 
 
-def decode_mla(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len, expert_num=2, print_console=False):
+def decode_mla(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len,
+               expert_num=2,
+               tp_list=None,
+               print_console=False):
     df = pd.DataFrame(columns=['GPU', 'BatchSize',
-                      'TP', 'LoadKV', 'DenseMLA', 'SparseMLA'])
-    tp_list = [1, 4, 8]
+                      'TP', 'LoadKVPerDevice', 'DenseMLA', 'SparseMLA'])
+    if tp_list is None:
+        tp_list = [1, 4, 8]
     for key in gpu_dict.keys():
         for bs in bs_list:
-            kv_cache = seq_len * (args.kv_lora_rank +
-                                  args.qk_rope_head_dim) * bs
-            load_kv_time = kv_cache / 1024/1024 / \
-                1024 / gpu_dict[key].get_mem_bw() * 1000
             dense_mla, sparse_mla = mla_elapse_time(args, gpu_dict[key],
                                                     seq_len, kv_cache_rate=1,
                                                     tp=tp_list,
@@ -501,6 +811,8 @@ def decode_mla(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len, expert_n
                 if bs > max_bs:
                     continue
                 else:
+                    load_kv_time = decode_kv_load_time(
+                        args, gpu_dict[key], seq_len, bs, tp_num)
                     df.loc[len(df)] = [gpu_dict[key].gpu_type, bs, tp_num,
                                        load_kv_time, dense_mla, sparse_mla[tp_num]]
     if print_console:
@@ -509,8 +821,49 @@ def decode_mla(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len, expert_n
     return df
 
 
-def decode_dense_mlp(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len, expert_num=2, print_console=False):
-    tp_list = [1, 4, 8]  # only used for calc max batchsize
+def decode_gqa(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len,
+               expert_num=2,
+               tp_list=None,
+               print_console=False):
+    df = pd.DataFrame(columns=['GPU', 'BatchSize',
+                      'TP', 'LoadKVPerDevice', 'DenseMLA', 'SparseMLA'])
+    if tp_list is None:
+        tp_list = [1, 4, 8]
+    for key in gpu_dict.keys():
+        for bs in bs_list:
+            dense_attn, sparse_attn = gqa_elapse_time(args, gpu_dict[key],
+                                                      seq_len, kv_cache_rate=1,
+                                                      tp=tp_list,
+                                                      batchsize=bs,
+                                                      decoding_mode=True,
+                                                      enable_gemm_fp4=True)
+            for tp_num in tp_list:
+                max_bs = _decoding_batchsize(
+                    args, gpu_dict[key], seq_len, decode_len, expert_num=expert_num, tp=tp_num)
+                if bs > max_bs:
+                    continue
+                load_kv_time = decode_kv_load_time(
+                    args, gpu_dict[key], seq_len, bs, tp_num)
+                df.loc[len(df)] = [gpu_dict[key].gpu_type, bs, tp_num,
+                                   load_kv_time, dense_attn, sparse_attn[tp_num]]
+    if print_console:
+        df['BatchSize'] = df['BatchSize'].astype(int).astype(str)
+        print(df.set_index('GPU').to_markdown(floatfmt='.3f'))
+    return df
+
+
+def decode_attention(args: ModelArgs, *func_args, **func_kwargs):
+    if is_gqa_model(args):
+        return decode_gqa(args, *func_args, **func_kwargs)
+    return decode_mla(args, *func_args, **func_kwargs)
+
+
+def decode_dense_mlp(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len,
+                     expert_num=2,
+                     tp_list=None,
+                     print_console=False):
+    if tp_list is None:
+        tp_list = [1, 4, 8]  # only used for calc max batchsize
     df = pd.DataFrame(columns=['GPU', 'BatchSize', 'TP', 'DenseMLP'])
     for key in gpu_dict.keys():
         for bs in bs_list:
@@ -614,8 +967,10 @@ def decode_moe_expert(args: ModelArgs, gpu_dict,
                       gemm_group_per_device,
                       device_num,
                       mbs=2, 
+                      tp_list=None,
                       print_console=False):
-    tp_list = [1, 4, 8]  # only used for calc max batchsize
+    if tp_list is None:
+        tp_list = [1, 4, 8]  # only used for calc max batchsize
     df = pd.DataFrame(columns=['GPU', 'BatchSize',
                       'TP', 'SharedExpert', 'RoutedExpert'])
     for gpu_key in gpu_dict.keys():
@@ -668,8 +1023,10 @@ def decode_a2a(args: ModelArgs, gpu_dict,
                bs_list, seq_len, decode_len,
                expert_num, device_num,
                mbs=2,
+               tp_list=None,
                print_console=False, fp8_combine=False):
-    tp_list = [1, 4, 8]  # only used for calc max batchsize
+    if tp_list is None:
+        tp_list = [1, 4, 8]  # only used for calc max batchsize
     df = pd.DataFrame(columns=['GPU', 'BatchSize',
                       'TP', 'Dispatch', 'Combine'])
     for key in gpu_dict.keys():
@@ -700,20 +1057,27 @@ def _decode_time(args: ModelArgs, gpu,
                  gemm_group_per_device,
                  device_num,
                  mbs=2,
+                 tp_list=None,
                  fp8_combine=False,
                  print_console=False):
 
     expert_per_device = gemm_group_per_device + 1  # add shared expert
-    mla = decode_mla(args, gpu, bs_list, seq_len,
-                     decode_len, expert_num=expert_per_device)
+    mla = decode_attention(args, gpu, bs_list, seq_len,
+                           decode_len,
+                           expert_num=expert_per_device,
+                           tp_list=tp_list)
     dense_mlp = decode_dense_mlp(
-        args, gpu, bs_list, seq_len, decode_len, expert_num=expert_per_device)
+        args, gpu, bs_list, seq_len, decode_len,
+        expert_num=expert_per_device,
+        tp_list=tp_list)
     moe = decode_moe_expert(args, gpu, bs_list, seq_len,
                             decode_len, mbs=mbs,
                             gemm_group_per_device=gemm_group_per_device,
-                            device_num=device_num)
+                            device_num=device_num,
+                            tp_list=tp_list)
     a2a = decode_a2a(args, gpu, bs_list, seq_len, decode_len,
-                     expert_num=expert_per_device, device_num= device_num,
+                     expert_num=expert_per_device, device_num=device_num,
+                     tp_list=tp_list,
                      fp8_combine=fp8_combine, mbs=mbs)
     dfs = [mla, dense_mlp, moe, a2a]
 
@@ -731,12 +1095,14 @@ def decode_time(args: ModelArgs, gpu_dict,
                 gemm_group_per_device,
                 device_num,
                 tps_limit=0,
+            tp_list=None,
                 fp8_combine=False,
                 print_console=False):
 
     df = _decode_time(args, gpu_dict, bs_list, seq_len, decode_len,
                       gemm_group_per_device=gemm_group_per_device,
                       device_num=device_num,
+                tp_list=tp_list,
                       fp8_combine=fp8_combine)
 
     def overlap_adjust(r):
@@ -746,8 +1112,8 @@ def decode_time(args: ModelArgs, gpu_dict,
             return r['TPOT_O']
 
     # 修正TP执行时间, 按照加载FP8的KV计算
-    df['DenseMLA'] = df['DenseMLA'] + df['LoadKV']
-    df['SparseMLA'] = df['SparseMLA'] + df['LoadKV']
+    df['DenseMLA'] = df['DenseMLA'] + df['LoadKVPerDevice']
+    df['SparseMLA'] = df['SparseMLA'] + df['LoadKVPerDevice']
     df['COMP_SUM'] = df['SparseMLA'] + df['SharedExpert'] + df['RoutedExpert']
     df['COMM_SUM'] = df['Dispatch'] + df['Combine']
     df['Delta'] = df['COMM_SUM'] - df['SparseMLA'] - df['SharedExpert']
@@ -756,7 +1122,7 @@ def decode_time(args: ModelArgs, gpu_dict,
                      df['RoutedExpert']) * (args.n_layers - args.n_dense_layers)
 
     df['TPOT'] = df.apply(lambda row:  overlap_adjust(row), axis=1)
-    df = df[['GPU', 'TP', 'BatchSize', 'DenseMLA', 'DenseMLP', 'SparseMLA', 'Combine',
+    df = df[['GPU', 'TP', 'BatchSize', 'LoadKVPerDevice', 'DenseMLA', 'DenseMLP', 'SparseMLA', 'Combine',
              'SharedExpert', 'RoutedExpert', 'Dispatch', 'COMP_SUM', 'COMM_SUM', 'Delta', 'TPOT', 'TPOT_O']]
     df['TPS'] = 1000 / df['TPOT']
     df['TPS_O'] = 1000 / df['TPOT_O']
@@ -773,6 +1139,7 @@ def decode_time(args: ModelArgs, gpu_dict,
 def decode_time_with_ep_list(args: ModelArgs, gpu_dict,
                              config: Config,
                              tps_limit=0,
+                             tp_list=None,
                              fp8_combine=False,
                              print_console=False):
     df_list = []
@@ -782,6 +1149,7 @@ def decode_time_with_ep_list(args: ModelArgs, gpu_dict,
                          config.decode_len,
                          gemm_group_per_device=gemm_group_per_device,
                          device_num=device_num,
+                         tp_list=tp_list,
                          fp8_combine=fp8_combine,
                          tps_limit=tps_limit,
                          print_console=False)
@@ -789,7 +1157,7 @@ def decode_time_with_ep_list(args: ModelArgs, gpu_dict,
         df_list.append(df)
     dd = pd.concat(df_list)
     dd.reset_index(inplace=True, drop=True)
-    order = ['GPU', 'TP', 'EP', 'BatchSize', 'DenseMLA', 'DenseMLP', 'SparseMLA',
+    order = ['GPU', 'TP', 'EP', 'BatchSize', 'LoadKVPerDevice', 'DenseMLA', 'DenseMLP', 'SparseMLA',
              'Combine', 'SharedExpert', 'RoutedExpert', 'Dispatch', 'COMP_SUM',
              'COMM_SUM', 'Delta', 'TPOT', 'TPOT_O', 'TPS', 'TPS_O', 'Total',
              'Total_O', 'Comm_Impact']
@@ -809,6 +1177,184 @@ def df_filter(df,gpu,device_num=0, bs=0,tps_limit=0, value_list=[]):
     if len(value_list) > 0:
         df_o = df_o[value_list]
     return df_o
+
+
+def decode_disaggregated_time(args: ModelArgs,
+                              attn_gpu: GPU_perf,
+                              ffn_gpu: GPU_perf,
+                              bs_list,
+                              seq_len,
+                              decode_len,
+                              gemm_group_per_device,
+                              device_num,
+                              tps_limit=0,
+                              tp_list=None,
+                              fp8_combine=False,
+                              cx9_bw=100,
+                              cx9_latency=0.005,
+                              print_console=False):
+    if tp_list is None:
+        tp_list = [1, 2, 4, 8]
+
+    expert_per_device = gemm_group_per_device + 1
+    mla = decode_attention(args, {attn_gpu.gpu_type: attn_gpu},
+                           bs_list, seq_len, decode_len,
+                           expert_num=expert_per_device,
+                           tp_list=tp_list)
+    dense_mlp = decode_dense_mlp(args, {ffn_gpu.gpu_type: ffn_gpu},
+                                 bs_list, seq_len, decode_len,
+                                 expert_num=expert_per_device,
+                                 tp_list=tp_list)
+    moe = decode_moe_expert(args, {ffn_gpu.gpu_type: ffn_gpu},
+                            bs_list, seq_len, decode_len,
+                            gemm_group_per_device=gemm_group_per_device,
+                            device_num=device_num,
+                            tp_list=tp_list)
+    a2a = decode_a2a(args, {ffn_gpu.gpu_type: ffn_gpu},
+                     bs_list, seq_len, decode_len,
+                     expert_num=expert_per_device,
+                     device_num=device_num,
+                     tp_list=tp_list,
+                     fp8_combine=fp8_combine)
+
+    dfs = [mla, dense_mlp, moe, a2a]
+    for decode_df in dfs:
+        decode_df['BatchSize'] = decode_df['BatchSize'].astype(int).astype(str)
+
+    df = reduce(lambda left, right: pd.merge(left, right, on=['BatchSize', 'TP'], how='inner'),
+                [mla[['BatchSize', 'TP', 'LoadKVPerDevice', 'DenseMLA', 'SparseMLA']],
+                 dense_mlp[['BatchSize', 'TP', 'DenseMLP']],
+                 moe[['BatchSize', 'TP', 'SharedExpert', 'RoutedExpert']],
+                 a2a[['BatchSize', 'TP', 'Dispatch', 'Combine']]])
+
+    def overlap_adjust(r):
+        if r['Delta'] > 0:
+            return r['TPOT_O'] + r['Delta'] * (args.n_layers - args.n_dense_layers)
+        else:
+            return r['TPOT_O']
+
+    df['Attn_GPU'] = attn_gpu.gpu_type
+    df['FFN_GPU'] = ffn_gpu.gpu_type
+    df['DenseMLA'] = df['DenseMLA'] + df['LoadKVPerDevice']
+    df['SparseMLA'] = df['SparseMLA'] + df['LoadKVPerDevice']
+    df['COMP_SUM'] = df['SparseMLA'] + df['SharedExpert'] + df['RoutedExpert']
+    df['COMM_SUM'] = df['Dispatch'] + df['Combine']
+    df['Delta'] = df['COMM_SUM'] - df['SparseMLA'] - df['SharedExpert']
+    df['TPOT_O'] = (df['DenseMLA'] + df['DenseMLP']) * args.n_dense_layers
+    df['TPOT_O'] += (df['SparseMLA'] + df['SharedExpert'] +
+                     df['RoutedExpert']) * (args.n_layers - args.n_dense_layers)
+    df['TPOT'] = df.apply(lambda row: overlap_adjust(row), axis=1)
+
+    batch_sizes = df['BatchSize'].astype(int)
+    df['InterStage'] = [inter_stage_link_time(bs, args, tp, link_bw=cx9_bw,
+                                              link_latency=cx9_latency)
+                        for bs, tp in zip(batch_sizes, df['TP'])]
+    df['TPOT_Disagg'] = df['TPOT'] + df['InterStage'] * args.n_layers
+    df['TPS'] = 1000 / df['TPOT']
+    df['TPS_O'] = 1000 / df['TPOT_O']
+    df['TPS_Disagg'] = 1000 / df['TPOT_Disagg']
+    df['Total'] = df['TPS'] * batch_sizes
+    df['Total_O'] = df['TPS_O'] * batch_sizes
+    df['Total_Disagg'] = df['TPS_Disagg'] * batch_sizes
+    df['Comm_Impact'] = (df['Total_O'] - df['Total']) / df['Total_O']
+    df['Disagg_Impact'] = (df['Total'] - df['Total_Disagg']) / df['Total']
+
+    df = df[df['TPS_Disagg'] > tps_limit]
+    order = ['Attn_GPU', 'FFN_GPU', 'TP', 'BatchSize', 'LoadKVPerDevice', 'DenseMLA', 'DenseMLP',
+             'SparseMLA', 'Combine', 'SharedExpert', 'RoutedExpert', 'Dispatch',
+             'InterStage', 'COMP_SUM', 'COMM_SUM', 'Delta', 'TPOT', 'TPOT_O',
+             'TPOT_Disagg', 'TPS', 'TPS_O', 'TPS_Disagg', 'Total', 'Total_O',
+             'Total_Disagg', 'Comm_Impact', 'Disagg_Impact']
+    df = df[order]
+    if print_console:
+        print(df.to_markdown(floatfmt='.3f'))
+    return df
+
+
+def profile_rubin_nvl72_disaggregated(args: ModelArgs,
+                                      config: Config,
+                                      gpu_dict,
+                                      decode_ffn_cabinet_list,
+                                      tp_list=None,
+                                      attn_gpu_type='Rubin-NVL72',
+                                      ffn_gpu_type='Rubin-NVL72',
+                                      cx9_bw=100,
+                                      cx9_latency=0.005,
+                                      fp8_combine=False,
+                                      tps_limit=0,
+                                      print_console=False):
+    """Profile a split deployment.
+
+    Prefill attention/FFN and decode attention stay on one Rubin-NVL72 cabinet.
+    Decode FFN is placed on one or more Rubin-NVL72 cabinets connected via CX9.
+    """
+    if tp_list is None:
+        tp_list = [1, 2, 4, 8]
+    tp_list = [tp for tp in tp_list if 0 < tp <= 8]
+    if len(tp_list) == 0:
+        raise ValueError('tp_list must contain at least one TP value within 1..8')
+
+    attn_gpu = gpu_dict[attn_gpu_type]
+    ffn_gpu = gpu_dict[ffn_gpu_type]
+    min_cabinet_num = min_cabinet_count_for_decode_ffn(args, ffn_gpu)
+
+    prefill_rows = []
+    decode_frames = []
+    for tp in tp_list:
+        dp = max(1, attn_gpu.gpu_per_node // tp)
+        _, prefill_summary = prefill_time(args,
+                                          {attn_gpu.gpu_type: attn_gpu},
+                                          config.seq_len,
+                                          config.kv_cache_rate,
+                                          tp=tp,
+                                          dp=dp,
+                                          print_console=False)
+        prefill_rows.append({
+            'Prefill_GPU': attn_gpu.gpu_type,
+            'TP': tp,
+            'DP': dp,
+            'Prefill_Cabinets': 1,
+            'Prefill_Total': prefill_summary.at['Sum', attn_gpu.gpu_type]
+        })
+
+    for cabinet_num in decode_ffn_cabinet_list:
+        device_num = cabinet_num * ffn_gpu.gpu_per_node
+        gemm_group_per_device = max(1, math.ceil(args.n_routed_experts / device_num))
+        df = decode_disaggregated_time(args,
+                                       attn_gpu,
+                                       ffn_gpu,
+                                       config.bs_list,
+                                       config.seq_len,
+                                       config.decode_len,
+                                       gemm_group_per_device=gemm_group_per_device,
+                                       device_num=device_num,
+                                       tps_limit=tps_limit,
+                                       tp_list=tp_list,
+                                       fp8_combine=fp8_combine,
+                                       cx9_bw=cx9_bw,
+                                       cx9_latency=cx9_latency,
+                                       print_console=False)
+        if df.empty:
+            continue
+        df['FFN_Cabinets'] = cabinet_num
+        df['FFN_Min_Cabinets'] = min_cabinet_num
+        df['Weight_Headroom'] = cabinet_num - min_cabinet_num
+        df['CX9_BW_GBs'] = cx9_bw
+        df['CX9_Latency_ms'] = cx9_latency
+        decode_frames.append(df)
+
+    prefill_df = pd.DataFrame(prefill_rows)
+    if decode_frames:
+        decode_df = pd.concat(decode_frames).reset_index(drop=True)
+    else:
+        decode_df = pd.DataFrame(columns=['Attn_GPU', 'FFN_GPU', 'TP', 'BatchSize',
+                                          'FFN_Cabinets', 'FFN_Min_Cabinets'])
+
+    if print_console:
+        print(prefill_df.to_markdown(floatfmt='.3f'))
+        if not decode_df.empty:
+            print(decode_df.to_markdown(floatfmt='.3f'))
+    return prefill_df, decode_df
 
 
 
