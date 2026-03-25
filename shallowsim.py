@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import os
 import pandas as pd
 import numpy as np
 import copy as copy
@@ -12,6 +13,17 @@ from typing import Tuple, Optional, Literal
 
 cm = sns.light_palette("red", as_cmap=True)
 NVL_GPU_LIST = [72, 144, 576]
+NVFP4_BITS_PER_PARAM = 4.5
+NVFP4_BYTES_PER_PARAM = NVFP4_BITS_PER_PARAM / 8
+MXFP8_BITS_PER_PARAM = 8
+MXFP8_BYTES_PER_PARAM = MXFP8_BITS_PER_PARAM / 8
+BF16_BITS_PER_PARAM = 16
+BF16_BYTES_PER_PARAM = BF16_BITS_PER_PARAM / 8
+PRECISION_BYTES_PER_PARAM = {
+    'NVFP4': NVFP4_BYTES_PER_PARAM,
+    'MXFP8': MXFP8_BYTES_PER_PARAM,
+    'BF16': BF16_BYTES_PER_PARAM,
+}
 
 class ModelArgs:
     max_batch_size: int = 8
@@ -46,6 +58,9 @@ class ModelArgs:
     beta_slow: int = 1
     mscale: float = 1.
     attn_type: str = 'MLA'
+    param_dtype: str = 'NVFP4'
+    kv_cache_dtype: str = 'NVFP4'
+    gemm_dtype: str = 'NVFP4'
 
 
 MODEL_ARG_FIELDS = [
@@ -55,7 +70,8 @@ MODEL_ARG_FIELDS = [
     'n_expert_groups', 'n_limited_groups', 'route_scale', 'q_lora_rank',
     'kv_lora_rank', 'qk_nope_head_dim', 'qk_rope_head_dim', 'v_head_dim',
     'original_seq_len', 'rope_theta', 'rope_factor', 'beta_fast',
-    'beta_slow', 'mscale', 'attn_type'
+    'beta_slow', 'mscale', 'attn_type', 'param_dtype', 'kv_cache_dtype',
+    'gemm_dtype'
 ]
 
 
@@ -73,6 +89,9 @@ MODEL_FIELD_ALIASES = {
     'n_routed_experts': ['n_routed_experts', 'expert'],
     'vocab_size': ['vocab_size', 'vocabulary', 'vacabulary'],
     'attn_type': ['attn_type', 'attention', 'attention_type'],
+    'param_dtype': ['param_dtype', 'weight_dtype', 'weight_precision'],
+    'kv_cache_dtype': ['kv_cache_dtype', 'kv_dtype', 'kv_precision'],
+    'gemm_dtype': ['gemm_dtype', 'compute_dtype', 'compute_precision'],
 }
 
 
@@ -276,6 +295,62 @@ def gqa_kv_cache_dim(args: ModelArgs):
     return args.n_kv_heads * (gqa_head_dim(args) + args.v_head_dim)
 
 
+def normalize_precision_name(precision, default='NVFP4'):
+    if precision is None:
+        return default
+    normalized = str(precision).strip().upper()
+    alias_map = {
+        'FP4': 'NVFP4',
+        'FP8': 'MXFP8',
+        'BF16': 'BF16',
+        'FP16': 'BF16',
+    }
+    normalized = alias_map.get(normalized, normalized)
+    if normalized not in PRECISION_BYTES_PER_PARAM:
+        raise ValueError(f'Unsupported precision: {precision}')
+    return normalized
+
+
+def param_mem_mb(param_count, precision):
+    precision_name = normalize_precision_name(precision)
+    return param_count * PRECISION_BYTES_PER_PARAM[precision_name] / 1024 / 1024
+
+
+def param_precision(args: ModelArgs):
+    return normalize_precision_name(getattr(args, 'param_dtype', 'NVFP4'))
+
+
+def kv_cache_precision(args: ModelArgs):
+    return normalize_precision_name(getattr(args, 'kv_cache_dtype', param_precision(args)))
+
+
+def gemm_precision(args: ModelArgs):
+    return normalize_precision_name(getattr(args, 'gemm_dtype', 'NVFP4'))
+
+
+def set_precision_mode(args: ModelArgs, precision, apply_to_params=True, apply_to_kv_cache=True):
+    precision_name = normalize_precision_name(precision)
+    args.gemm_dtype = precision_name
+    if apply_to_params:
+        args.param_dtype = precision_name
+    if apply_to_kv_cache:
+        args.kv_cache_dtype = precision_name
+    return args
+
+
+def get_lowp_flops(gpu: GPU_perf, precision):
+    precision_name = normalize_precision_name(precision)
+    if precision_name == 'NVFP4':
+        return gpu.get_fp4_flops() if gpu.get_fp4_flops() != 0 else gpu.get_fp8_flops()
+    if precision_name == 'MXFP8':
+        return gpu.get_fp8_flops()
+    return gpu.get_fp16_flops()
+
+
+def uses_native_fp4(gpu: GPU_perf, args: ModelArgs):
+    return gemm_precision(args) == 'NVFP4' and gpu.get_fp4_flops() != 0
+
+
 def gqa_flops(q_len, kv_len, args: ModelArgs, kv_cache_rate):
     q_proj = q_len * args.dim * args.n_heads * gqa_head_dim(args)
     k_proj = kv_len * args.dim * args.n_kv_heads * gqa_head_dim(args)
@@ -284,15 +359,13 @@ def gqa_flops(q_len, kv_len, args: ModelArgs, kv_cache_rate):
 
     k_proj = k_proj * (1 - kv_cache_rate)
     v_proj = v_proj * (1 - kv_cache_rate)
-    gemm_sum = q_proj + k_proj + v_proj + o_proj
+    lowp_sum = q_proj + k_proj + v_proj + o_proj
+    qk_fp16_sum = args.n_heads * q_len * gqa_head_dim(args) * kv_len
+    score_v_lowp = args.n_heads * q_len * kv_len * args.v_head_dim
 
-    attn_sum = args.n_heads * (
-        q_len * gqa_head_dim(args) * kv_len +
-        q_len * kv_len * args.v_head_dim)
-
-    gemm_sum = gemm_sum * 2 / 1e9
-    attn_sum = attn_sum * 2 / 1e9
-    return gemm_sum + attn_sum, gemm_sum, attn_sum
+    lowp_flops = (lowp_sum + score_v_lowp) * 2 / 1e9
+    qk_fp16_flops = qk_fp16_sum * 2 / 1e9
+    return lowp_flops + qk_fp16_flops, lowp_flops, qk_fp16_flops
 
 
 def gqa_mem(args: ModelArgs):
@@ -300,7 +373,7 @@ def gqa_mem(args: ModelArgs):
     k_proj = args.dim * args.n_kv_heads * gqa_head_dim(args)
     v_proj = args.dim * args.n_kv_heads * args.v_head_dim
     o_proj = args.n_heads * args.v_head_dim * args.dim
-    return (q_proj + k_proj + v_proj + o_proj) / 1024 / 1024
+    return param_mem_mb(q_proj + k_proj + v_proj + o_proj, param_precision(args))
 
 
 def gqa_elapse_time(args: ModelArgs,
@@ -316,20 +389,19 @@ def gqa_elapse_time(args: ModelArgs,
                     gqa_kernel_static_time=0.05,
                     print_console=False):
     if decoding_mode:
-        _, gemm_flops, attn_fp16_flops = gqa_flops(1, seq_len, args, 1)
-        gemm_flops *= batchsize
-        attn_fp16_flops *= batchsize
+        _, lowp_flops, qk_fp16_flops = gqa_flops(1, seq_len, args, 1)
+        lowp_flops *= batchsize
+        qk_fp16_flops *= batchsize
     else:
-        _, gemm_flops, attn_fp16_flops = gqa_flops(seq_len, seq_len, args, kv_cache_rate)
+        _, lowp_flops, qk_fp16_flops = gqa_flops(seq_len, seq_len, args, kv_cache_rate)
 
-    gemm_fp8_t = gemm_flops / gpu.get_fp8_flops() / gqa_discount
-    attn_fp16_t = attn_fp16_flops / gpu.get_fp16_flops() / gqa_discount
+    lowp_t = lowp_flops / get_lowp_flops(gpu, gemm_precision(args)) / gqa_discount
+    qk_fp16_t = qk_fp16_flops / gpu.get_fp16_flops() / gqa_discount
     load_t = gqa_mem(args) / gpu.get_mem_bw()
 
-    total = gemm_fp8_t + attn_fp16_t + load_t
-    if enable_gemm_fp4 and gpu.get_fp4_flops() != 0:
-        gemm_fp4_t = gemm_flops / gpu.get_fp4_flops()
-        total = gemm_fp4_t + attn_fp16_t
+    total = lowp_t + qk_fp16_t + load_t
+    if enable_gemm_fp4 and uses_native_fp4(gpu, args):
+        total = lowp_flops / gpu.get_fp4_flops() + qk_fp16_t
 
     ar_len = batchsize if decoding_mode else seq_len
     all_reduce_comm_size = ar_len * args.dim * 2 / 1024 / 1024
@@ -343,10 +415,10 @@ def gqa_elapse_time(args: ModelArgs,
             tp_time[v] = total / v + all_reduce_t + gqa_kernel_static_time
 
     if print_console:
-        print("[%8s]GQA_GEMM_FP8 Elapsed time(ms): %.3f" %
-              (gpu.gpu_type, gemm_fp8_t))
-        print("[%8s]GQA_ATTN_FP16 Elapsed time(ms): %.3f" %
-              (gpu.gpu_type, attn_fp16_t))
+        print("[%8s]GQA_%s Elapsed time(ms): %.3f" %
+              (gpu.gpu_type, gemm_precision(args), lowp_t))
+        print("[%8s]GQA_QK_FP16 Elapsed time(ms): %.3f" %
+              (gpu.gpu_type, qk_fp16_t))
     return total, tp_time
 
 
@@ -377,11 +449,11 @@ def decode_kv_cache_load_divisor(args: ModelArgs, tp):
 def decode_kv_cache_bytes(args: ModelArgs, seq_len, decode_len, tp):
     token_num = seq_len + decode_len
     kv_dim = attn_kv_cache_dim(args)
-    return token_num * kv_dim * args.n_layers * decode_kv_cache_storage_multiplier(args, tp)
+    return token_num * kv_dim * args.n_layers * decode_kv_cache_storage_multiplier(args, tp) * PRECISION_BYTES_PER_PARAM[kv_cache_precision(args)]
 
 
 def decode_kv_load_time(args: ModelArgs, gpu: GPU_perf, seq_len, batchsize, tp):
-    kv_cache = seq_len * attn_kv_cache_dim(args) * batchsize
+    kv_cache = seq_len * attn_kv_cache_dim(args) * batchsize * PRECISION_BYTES_PER_PARAM[kv_cache_precision(args)]
     kv_cache = kv_cache / decode_kv_cache_load_divisor(args, tp)
     return kv_cache / 1024 / 1024 / 1024 / gpu.get_mem_bw() * 1000
 
@@ -404,19 +476,17 @@ def mla_flops(q_len, kv_len, args: ModelArgs, kv_cache_rate):
     v_up_proj = kv_len * args.kv_lora_rank * args.n_heads * args.v_head_dim  # w_uv
 
     kv_down_proj = kv_down_proj * (1 - kv_cache_rate)
-    gemm_sum = q_down_proj + q_up_proj + kv_down_proj + k_up_proj + v_up_proj
+    lowp_sum = q_down_proj + q_up_proj + kv_down_proj + k_up_proj + v_up_proj
 
     # 把它看成一个标准的args.n_heads的MHA
-    mha = args.n_heads * (q_len * args.qk_rope_head_dim * kv_len  # QK_score_rope
-                          + q_len * args.qk_nope_head_dim * kv_len  # QK_score_nope
-                          + q_len * kv_len * args.v_head_dim)  # ScoreV
+    qk_sum = args.n_heads * (q_len * args.qk_rope_head_dim * kv_len  # QK_score_rope
+                             + q_len * args.qk_nope_head_dim * kv_len)  # QK_score_nope
+    score_v = args.n_heads * q_len * kv_len * args.v_head_dim  # ScoreV
     wo = q_len * args.n_heads * args.v_head_dim * args.dim  # wo
-    attn_sum = mha + wo
-    # return flops by 2* Sum(MACs)
-    GEMM_FP8_FLOPS = gemm_sum * 2/1e9
-    ATTN_FP16_FLOPS = attn_sum * 2/1e9
+    lowp_flops = (lowp_sum + score_v + wo) * 2 / 1e9
+    qk_fp16_flops = qk_sum * 2 / 1e9
 
-    return GEMM_FP8_FLOPS+ATTN_FP16_FLOPS, GEMM_FP8_FLOPS, ATTN_FP16_FLOPS
+    return lowp_flops + qk_fp16_flops, lowp_flops, qk_fp16_flops
 
 # 矩阵吸收的版本
 
@@ -432,22 +502,19 @@ def mla_matabsob_flops(q_len, kv_len, args: ModelArgs, kv_cache_rate=0):
     kv_down_proj = kv_len * args.dim * \
         (args.kv_lora_rank + args.qk_rope_head_dim)  # wkv_a
     kv_down_proj = kv_down_proj * (1 - kv_cache_rate)  # KV-Cache命中率修正
-    gemm_sum = q_down_proj + q_rope_up_proj + q_absorb + kv_down_proj
+    lowp_sum = q_down_proj + q_rope_up_proj + q_absorb + kv_down_proj
 
     # 把它看成一个标准的args.n_heads的MQA
-    mqa = args.n_heads * (q_len * args.qk_rope_head_dim * kv_len  # Score_rope
-                          + q_len * args.kv_lora_rank * kv_len  # Score_nope
-                          + q_len * kv_len * args.kv_lora_rank)  # Score V
+    qk_sum = args.n_heads * (q_len * args.qk_rope_head_dim * kv_len  # Score_rope
+                             + q_len * args.kv_lora_rank * kv_len)  # Score_nope
+    score_v = args.n_heads * q_len * kv_len * args.kv_lora_rank  # ScoreV
 
     attn_up_proj = q_len * args.n_heads * args.v_head_dim * args.kv_lora_rank
     o_proj = q_len * args.n_heads * args.v_head_dim * args.dim
-    attn_sum = mqa + attn_up_proj + o_proj
+    lowp_flops = (lowp_sum + score_v + attn_up_proj + o_proj) * 2 / 1e9
+    qk_fp16_flops = qk_sum * 2 / 1e9
 
-    # return flops by 2* Sum(MACs)
-    gemm_sum = gemm_sum * 2/1e9
-    attn_sum = attn_sum * 2/1e9
-
-    return gemm_sum + attn_sum, gemm_sum, attn_sum
+    return lowp_flops + qk_fp16_flops, lowp_flops, qk_fp16_flops
 
 
 def mla_mem(args: ModelArgs):
@@ -459,7 +526,8 @@ def mla_mem(args: ModelArgs):
     k_up_proj = args.kv_lora_rank * args.n_heads * args.qk_nope_head_dim  # w_uk
     v_up_proj = args.kv_lora_rank * args.n_heads * args.v_head_dim  # w_uv
     wo = args.n_heads * args.v_head_dim * args.dim  # wo
-    return (q_down_proj + q_up_proj + k_up_proj + kv_down_proj + v_up_proj + wo)/1024/1024
+    return param_mem_mb(q_down_proj + q_up_proj + k_up_proj + kv_down_proj + v_up_proj + wo,
+                        param_precision(args))
 
 
 def mla_elapse_time(args: ModelArgs,
@@ -476,29 +544,28 @@ def mla_elapse_time(args: ModelArgs,
                     print_console=False):
     if decoding_mode:
         # Decoding时计算为qlen=1, kv_cache_rate = 1
-        _, gemm_flops, attn_fp16_flops = mla_matabsob_flops(
+        _, lowp_flops, qk_fp16_flops = mla_matabsob_flops(
             1, seq_len, args, 1)
-        gemm_flops *= batchsize
-        attn_fp16_flops *= batchsize
+        lowp_flops *= batchsize
+        qk_fp16_flops *= batchsize
     else:
         # prefill阶段使用非吸收的版本
-        _, gemm_flops, attn_fp16_flops = mla_flops(
+        _, lowp_flops, qk_fp16_flops = mla_flops(
             seq_len, seq_len, args, kv_cache_rate)
-    gemm_fp8_t = gemm_flops / gpu.get_fp8_flops() / mla_discount
-    attn_fp16_t = attn_fp16_flops / gpu.get_fp16_flops() / mla_discount
+    lowp_t = lowp_flops / get_lowp_flops(gpu, gemm_precision(args)) / mla_discount
+    qk_fp16_t = qk_fp16_flops / gpu.get_fp16_flops() / mla_discount
 
     # load weight
     load_t = mla_mem(args) / gpu.get_mem_bw()
 
-    total = gemm_fp8_t + attn_fp16_t + load_t
+    total = lowp_t + qk_fp16_t + load_t
 
     if enable_gemm_fp4:
-        if gpu.get_fp4_flops() == 0:
+        if gemm_precision(args) == 'NVFP4' and gpu.get_fp4_flops() == 0:
             if print_console:
                 print('[%8s]This GPU does not support FP4' % gpu.gpu_type)
-        else:
-            gemm_fp4_t = gemm_flops / gpu.get_fp4_flops()
-            total = gemm_fp4_t + attn_fp16_t
+        elif uses_native_fp4(gpu, args):
+            total = lowp_flops / gpu.get_fp4_flops() + qk_fp16_t
 
     ar_len = batchsize if decoding_mode else seq_len
     all_reduce_comm_size = ar_len * args.dim * 2 / 1024/1024  # fp16 take 2Bytes
@@ -512,18 +579,15 @@ def mla_elapse_time(args: ModelArgs,
             tp_time[v] = total / v + all_reduce_t + mla_kernel_static_time
 
     if print_console:
-        if enable_gemm_fp4 & (gpu.get_fp4_flops() != 0):
-            print("[%8s]GEMM_FP4 Elapsed time(ms): %.3f" %
-                  (gpu.gpu_type, gemm_fp4_t))
-        print("[%8s]GEMM_FP8 Elapsed time(ms): %.3f" %
-              (gpu.gpu_type, gemm_fp8_t))
-        print("[%8s]ATTN_FP16 Elapsed time(ms): %.3f" %
-              (gpu.gpu_type, attn_fp16_t))
-        print("[%8s]Total Elapsed time(ms):%.3f" % (gpu.gpu_type, total))
-        print("[%8s]AR Elapsed time(ms):%.3f" % (gpu.gpu_type, all_reduce_t))
-        for v in tp:
+          print("[%8s]%s Elapsed time(ms): %.3f" %
+              (gpu.gpu_type, gemm_precision(args), lowp_t))
+          print("[%8s]QK_FP16 Elapsed time(ms): %.3f" %
+              (gpu.gpu_type, qk_fp16_t))
+          print("[%8s]Total Elapsed time(ms):%.3f" % (gpu.gpu_type, total))
+          print("[%8s]AR Elapsed time(ms):%.3f" % (gpu.gpu_type, all_reduce_t))
+          for v in tp:
             print("[%8s]TP[%2d] Elapsed time(ms):%.3f" %
-                  (gpu.gpu_type, v, tp_time[v]))
+                (gpu.gpu_type, v, tp_time[v]))
 
     return total, tp_time
 
@@ -564,15 +628,12 @@ def densmlp_flops(args: ModelArgs, seq_len):
 
 
 def densmlp_mem(args: ModelArgs):
-    return 3 * args.dim * args.inter_dim / 1024/1024
+    return param_mem_mb(3 * args.dim * args.inter_dim, param_precision(args))
 
 
 def _prefill_dense_mlp(args: ModelArgs, gpu: GPU_perf, seq_len, print_console=False):
     gemm_flops = densmlp_flops(args, seq_len)
-    if gpu.get_fp4_flops() != 0:
-        gemm_time = gemm_flops / gpu.get_fp4_flops()
-    else:
-        gemm_time = gemm_flops / gpu.get_fp8_flops()
+    gemm_time = gemm_flops / get_lowp_flops(gpu, gemm_precision(args))
 
     load_time = densmlp_mem(args) / gpu.get_mem_bw()
     gemm_time = gemm_time + load_time
@@ -596,12 +657,12 @@ def moe_expert_flops(args: ModelArgs, seq_len):
 
 
 def moe_expert_mem(args: ModelArgs):
-    return 3 * args.dim * args.moe_inter_dim / 1024 / 1024
+    return param_mem_mb(3 * args.dim * args.moe_inter_dim, param_precision(args))
 
 
 def _prefill_moe(args: ModelArgs, gpu: GPU_perf, seq_len, tp, dp):
     load_time = moe_expert_mem(args) / gpu.get_mem_bw()
-    gemm_flops = gpu.get_fp4_flops() if gpu.get_fp4_flops() != 0 else gpu.get_fp8_flops()
+    gemm_flops = get_lowp_flops(gpu, gemm_precision(args))
     num_device = tp * dp
     num_shared_token = dp * seq_len / num_device
     shared_flops = moe_expert_flops(args, num_shared_token)
@@ -728,10 +789,11 @@ def decode_other_parameter_gb(args: ModelArgs):
     - normalization weights
     """
     sparse_layer_num = args.n_layers - args.n_dense_layers
-    embedding_and_head_gb = 2 * args.vocab_size * args.dim / 1024 / 1024 / 1024
+    param_bytes = PRECISION_BYTES_PER_PARAM[param_precision(args)]
+    embedding_and_head_gb = 2 * args.vocab_size * args.dim * param_bytes / 1024 / 1024 / 1024
     dense_mlp_gb = densmlp_mem(args) * args.n_dense_layers / 1024
-    router_gb = sparse_layer_num * args.dim * args.n_routed_experts / 1024 / 1024 / 1024
-    norm_gb = ((2 * args.n_layers) + 1) * args.dim / 1024 / 1024 / 1024
+    router_gb = sparse_layer_num * args.dim * args.n_routed_experts * param_bytes / 1024 / 1024 / 1024
+    norm_gb = ((2 * args.n_layers) + 1) * args.dim * param_bytes / 1024 / 1024 / 1024
     return embedding_and_head_gb + dense_mlp_gb + router_gb + norm_gb
 
 
@@ -861,6 +923,7 @@ def decode_attention(args: ModelArgs, *func_args, **func_kwargs):
 def decode_dense_mlp(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len,
                      expert_num=2,
                      tp_list=None,
+                     filter_by_max_bs=True,
                      print_console=False):
     if tp_list is None:
         tp_list = [1, 4, 8]  # only used for calc max batchsize
@@ -869,12 +932,12 @@ def decode_dense_mlp(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len,
         for bs in bs_list:
             t = _prefill_dense_mlp(args, gpu_dict[key], bs)
             for tp_num in tp_list:
-                max_bs = _decoding_batchsize(
-                    args, gpu_dict[key], seq_len, decode_len, expert_num=expert_num, tp=tp_num)
-                if bs > max_bs:
-                    continue
-                else:
-                    df.loc[len(df)] = [gpu_dict[key].gpu_type, bs, tp_num, t]
+                if filter_by_max_bs:
+                    max_bs = _decoding_batchsize(
+                        args, gpu_dict[key], seq_len, decode_len, expert_num=expert_num, tp=tp_num)
+                    if bs > max_bs:
+                        continue
+                df.loc[len(df)] = [gpu_dict[key].gpu_type, bs, tp_num, t]
     if print_console:
         df['BatchSize'] = df['BatchSize'].astype(int).astype(str)
         print(df[df['TP'] == 1][['GPU', 'BatchSize', 'DenseMLP']
@@ -891,12 +954,29 @@ def n_pow2_range(n:int):
     n = n+1
     return n
 
+
+def groq_flops_discount_table(isa_m=4):
+    """Approximate GROQ group-gemm efficiency from M-dimension alignment.
+
+    GROQ ISA is modeled as 4 x (1 x 320 och x 320 ich). In this decode expert
+    path, the discount table is keyed by m_per_group only, so we model the
+    throughput loss from the M dimension needing to align to 4. The N/K
+    dimensions correspond to och/ich=320 and are treated as aligned here.
+    """
+    buckets = [1, 2, 4, 8, 16, 32, 64, 128, 256,
+               512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
+    table = {}
+    for bucket in buckets:
+        aligned_m = math.ceil(bucket / isa_m) * isa_m
+        table[bucket] = bucket / aligned_m
+    return table
+
 def _decode_moe_expert(args: ModelArgs, gpu: GPU_perf, bs, 
                        gemm_group_per_device, device_num):
     load_time = moe_expert_mem(args) / gpu.get_mem_bw()
-    if gpu.get_fp4_flops() != 0:
-        load_time = load_time /2
-    gpu_flops = gpu.get_fp4_flops() if gpu.get_fp4_flops() != 0 else gpu.get_fp8_flops()
+    if uses_native_fp4(gpu, args):
+        load_time = load_time / 2
+    gpu_flops = get_lowp_flops(gpu, gemm_precision(args))
     
     total_expert = gemm_group_per_device * device_num
     m_per_group = bs * args.n_activated_experts * device_num / total_expert
@@ -951,6 +1031,9 @@ def _decode_moe_expert(args: ModelArgs, gpu: GPU_perf, bs,
         65536: 1.0
     }
 
+    if gpu.gpu_type.find('GROQ') != -1:
+        flops_discounts = groq_flops_discount_table()
+
     gpu_flops = gpu_flops * flops_discounts[n_pow2_range(int(m_per_group))]
     
     shared_flops = moe_expert_flops(args, bs)
@@ -968,6 +1051,7 @@ def decode_moe_expert(args: ModelArgs, gpu_dict,
                       device_num,
                       mbs=2, 
                       tp_list=None,
+                      filter_by_max_bs=True,
                       print_console=False):
     if tp_list is None:
         tp_list = [1, 4, 8]  # only used for calc max batchsize
@@ -982,14 +1066,14 @@ def decode_moe_expert(args: ModelArgs, gpu_dict,
             s *= mbs
             r *= mbs
             for tp_num in tp_list:
-                max_bs = _decoding_batchsize(
-                    args, gpu_dict[gpu_key], seq_len, decode_len, 
-                    expert_num= gemm_group_per_device+1, tp=tp_num)
-                if bs > max_bs:
-                    continue
-                else:
-                    df.loc[len(df)] = [gpu_dict[gpu_key].gpu_type,
-                                       str(bs), tp_num, s, r]
+                if filter_by_max_bs:
+                    max_bs = _decoding_batchsize(
+                        args, gpu_dict[gpu_key], seq_len, decode_len, 
+                        expert_num= gemm_group_per_device+1, tp=tp_num)
+                    if bs > max_bs:
+                        continue
+                df.loc[len(df)] = [gpu_dict[gpu_key].gpu_type,
+                                   str(bs), tp_num, s, r]
     if print_console:
         df['BatchSize'] = df['BatchSize'].astype(int).astype(str)
         print(df[df['TP'] == 1][['GPU', 'BatchSize', 'SharedExpert',
@@ -1024,6 +1108,7 @@ def decode_a2a(args: ModelArgs, gpu_dict,
                expert_num, device_num,
                mbs=2,
                tp_list=None,
+               filter_by_max_bs=True,
                print_console=False, fp8_combine=False):
     if tp_list is None:
         tp_list = [1, 4, 8]  # only used for calc max batchsize
@@ -1036,15 +1121,15 @@ def decode_a2a(args: ModelArgs, gpu_dict,
                 expert_num=expert_num, device_num=device_num, 
                 mbs=mbs, fp8_combine=fp8_combine)
             for tp_num in tp_list:
-                max_bs = _decoding_batchsize(
-                    args, gpu_dict[key], 
-                    seq_len, decode_len, 
-                    expert_num=expert_num, tp=tp_num)
-                if bs > max_bs:
-                    continue
-                else:
-                    df.loc[len(df)] = [gpu_dict[key].gpu_type, bs,
-                                       tp_num, dispatch_time, combine_time]
+                if filter_by_max_bs:
+                    max_bs = _decoding_batchsize(
+                        args, gpu_dict[key], 
+                        seq_len, decode_len, 
+                        expert_num=expert_num, tp=tp_num)
+                    if bs > max_bs:
+                        continue
+                df.loc[len(df)] = [gpu_dict[key].gpu_type, bs,
+                                   tp_num, dispatch_time, combine_time]
     if print_console:
         df['BatchSize'] = df['BatchSize'].astype(int).astype(str)
         print(df[df['TP'] == 1][['GPU', 'BatchSize', 'Dispatch', 'Combine']].set_index(
@@ -1204,17 +1289,20 @@ def decode_disaggregated_time(args: ModelArgs,
     dense_mlp = decode_dense_mlp(args, {ffn_gpu.gpu_type: ffn_gpu},
                                  bs_list, seq_len, decode_len,
                                  expert_num=expert_per_device,
-                                 tp_list=tp_list)
+                                 tp_list=tp_list,
+                                 filter_by_max_bs=False)
     moe = decode_moe_expert(args, {ffn_gpu.gpu_type: ffn_gpu},
                             bs_list, seq_len, decode_len,
                             gemm_group_per_device=gemm_group_per_device,
                             device_num=device_num,
-                            tp_list=tp_list)
+                    tp_list=tp_list,
+                    filter_by_max_bs=False)
     a2a = decode_a2a(args, {ffn_gpu.gpu_type: ffn_gpu},
                      bs_list, seq_len, decode_len,
                      expert_num=expert_per_device,
                      device_num=device_num,
                      tp_list=tp_list,
+                filter_by_max_bs=False,
                      fp8_combine=fp8_combine)
 
     dfs = [mla, dense_mlp, moe, a2a]
@@ -1357,6 +1445,332 @@ def profile_rubin_nvl72_disaggregated(args: ModelArgs,
     return prefill_df, decode_df
 
 
+def groq_candidate_device_counts(args: ModelArgs,
+                                 ffn_gpu: GPU_perf,
+                                 weight_util_rate=0.9,
+                                 max_device_num=None):
+    min_device_num = max(
+        1,
+        math.ceil(decode_ffn_weight_gb(args) / (ffn_gpu.mem * weight_util_rate))
+    )
+    if max_device_num is None:
+        max_device_num = max(min_device_num, args.n_routed_experts)
+    else:
+        max_device_num = max(min_device_num, max_device_num)
+
+    if min_device_num >= max_device_num:
+        return [min_device_num], min_device_num
+
+    device_counts = []
+    seen_group_counts = set()
+    for device_num in range(min_device_num, max_device_num + 1):
+        gemm_group_per_device = max(1, math.ceil(args.n_routed_experts / device_num))
+        if gemm_group_per_device in seen_group_counts:
+            continue
+        seen_group_counts.add(gemm_group_per_device)
+        device_counts.append(device_num)
+        if gemm_group_per_device == 1:
+            break
+    return device_counts, min_device_num
+
+
+def _disagg_usable_attn_memory_gb(args: ModelArgs,
+                                  attn_gpu: GPU_perf,
+                                  tp):
+    mem_util_rate = 0.9
+    attn_param_gb = attn_mem(args) * args.n_layers / tp / 1024
+    return mem_util_rate * attn_gpu.mem - decode_other_parameter_gb(args) - attn_param_gb
+
+
+def build_disaggregated_candidate_rows(args: ModelArgs,
+                                       model_name,
+                                       config_name,
+                                       decode_df,
+                                       attn_gpu: GPU_perf,
+                                       ffn_gpu: GPU_perf,
+                                       seq_len,
+                                       decode_len,
+                                       min_device_num,
+                                       cx9_bw,
+                                       cx9_latency):
+    if decode_df.empty:
+        return decode_df
+
+    sparse_layers = args.n_layers - args.n_dense_layers
+    result_df = decode_df.copy()
+    batch_sizes = result_df['BatchSize'].astype(int)
+
+    result_df['Model'] = model_name
+    result_df['Config'] = config_name
+    result_df['CX9_BW_GBs'] = cx9_bw
+    result_df['CX9_Latency_ms'] = cx9_latency
+    result_df['DeviceNum'] = result_df['DeviceNum'].astype(int)
+    result_df['MinGroqDevicesByWeight'] = min_device_num
+    result_df['ExtraDevicesNeeded'] = result_df['DeviceNum'] - min_device_num
+    result_df['WeightGB'] = decode_ffn_weight_gb(args)
+    result_df['UsableRubinGB'] = [
+        _disagg_usable_attn_memory_gb(args, attn_gpu, tp)
+        for tp in result_df['TP']
+    ]
+    result_df['KVCacheGBPerRubinGPU'] = [
+        decode_kv_cache_bytes(args, seq_len, decode_len, tp) * bs / 1024 / 1024 / 1024
+        for tp, bs in zip(result_df['TP'], batch_sizes)
+    ]
+    result_df['KVCacheUtilOnRubin'] = (
+        result_df['KVCacheGBPerRubinGPU'] / result_df['UsableRubinGB']
+    )
+
+    result_df['LoadKV_ms_per_layer'] = result_df['LoadKVPerDevice']
+    result_df['DenseMLA_ms_per_layer'] = result_df['DenseMLA']
+    result_df['DenseMLP_ms_per_layer'] = result_df['DenseMLP']
+    result_df['SparseMLA_ms_per_layer'] = result_df['SparseMLA']
+    result_df['SharedExpert_ms_per_layer'] = result_df['SharedExpert']
+    result_df['RoutedExpert_ms_per_layer'] = result_df['RoutedExpert']
+    result_df['Dispatch_ms_per_layer'] = result_df['Dispatch']
+    result_df['Combine_ms_per_layer'] = result_df['Combine']
+    result_df['InterStage_ms_per_layer'] = result_df['InterStage']
+
+    result_df['InterStageTotal_ms'] = result_df['InterStage_ms_per_layer'] * args.n_layers
+    result_df['DenseAttnTotal_ms'] = result_df['DenseMLA_ms_per_layer'] * args.n_dense_layers
+    result_df['DenseFFNTotal_ms'] = result_df['DenseMLP_ms_per_layer'] * args.n_dense_layers
+    result_df['SparseAttnTotal_ms'] = result_df['SparseMLA_ms_per_layer'] * sparse_layers
+    result_df['SharedExpertTotal_ms'] = result_df['SharedExpert_ms_per_layer'] * sparse_layers
+    result_df['RoutedExpertTotal_ms'] = result_df['RoutedExpert_ms_per_layer'] * sparse_layers
+    result_df['ExposedMoECommTotal_ms'] = np.maximum(result_df['Delta'], 0) * sparse_layers
+
+    total_time = (
+        result_df['InterStageTotal_ms']
+        + result_df['DenseAttnTotal_ms']
+        + result_df['DenseFFNTotal_ms']
+        + result_df['SparseAttnTotal_ms']
+        + result_df['SharedExpertTotal_ms']
+        + result_df['RoutedExpertTotal_ms']
+        + result_df['ExposedMoECommTotal_ms']
+    )
+    result_df['DenseAttnPct'] = result_df['DenseAttnTotal_ms'] / total_time
+    result_df['DenseFFNPct'] = result_df['DenseFFNTotal_ms'] / total_time
+    result_df['SparseAttnPct'] = result_df['SparseAttnTotal_ms'] / total_time
+    result_df['SharedExpertPct'] = result_df['SharedExpertTotal_ms'] / total_time
+    result_df['RoutedExpertPct'] = result_df['RoutedExpertTotal_ms'] / total_time
+    result_df['ExposedMoECommPct'] = result_df['ExposedMoECommTotal_ms'] / total_time
+    result_df['InterStagePct'] = result_df['InterStageTotal_ms'] / total_time
+
+    ordered_columns = [
+        'Model', 'Config', 'FFN_GPU', 'Attn_GPU', 'CX9_BW_GBs', 'CX9_Latency_ms',
+        'DeviceNum', 'MinGroqDevicesByWeight', 'ExtraDevicesNeeded', 'TP', 'BatchSize',
+        'WeightGB', 'UsableRubinGB', 'KVCacheGBPerRubinGPU', 'KVCacheUtilOnRubin',
+        'LoadKV_ms_per_layer', 'DenseMLA_ms_per_layer', 'DenseMLP_ms_per_layer',
+        'SparseMLA_ms_per_layer', 'SharedExpert_ms_per_layer', 'RoutedExpert_ms_per_layer',
+        'Dispatch_ms_per_layer', 'Combine_ms_per_layer', 'InterStage_ms_per_layer',
+        'InterStageTotal_ms', 'DenseAttnTotal_ms', 'DenseFFNTotal_ms',
+        'SparseAttnTotal_ms', 'SharedExpertTotal_ms', 'RoutedExpertTotal_ms',
+        'ExposedMoECommTotal_ms', 'DenseAttnPct', 'DenseFFNPct', 'SparseAttnPct',
+        'SharedExpertPct', 'RoutedExpertPct', 'ExposedMoECommPct', 'InterStagePct',
+        'TPOT_Disagg', 'TPS_Disagg', 'Total_Disagg'
+    ]
+    return result_df[ordered_columns].rename(columns={'TPOT_Disagg': 'TPOT_Disagg_ms'})
+
+
+def select_best_disaggregated_rows(candidate_df,
+                                   target_tps_list,
+                                   target_metric='TPS_Disagg'):
+    if candidate_df.empty:
+        return candidate_df
+
+    selected_rows = []
+    for (model_name, config_name), group_df in candidate_df.groupby(['Model', 'Config'], sort=False):
+        sorted_group = group_df.sort_values(
+            ['DeviceNum', 'TPOT_Disagg_ms', 'BatchSize', 'TP'],
+            ascending=[True, True, True, True]
+        ).reset_index(drop=True)
+        best_achievable = sorted_group.sort_values(
+            [target_metric, 'DeviceNum', 'TPOT_Disagg_ms', 'BatchSize', 'TP'],
+            ascending=[False, True, True, True, True]
+        ).reset_index(drop=True)
+        for target_tps in target_tps_list:
+            feasible_df = sorted_group[sorted_group[target_metric] >= target_tps].reset_index(drop=True)
+            if not feasible_df.empty:
+                selected_row = feasible_df.iloc[0].copy()
+                selected_row['Feasible'] = True
+                selected_row['Reason'] = ''
+            else:
+                selected_row = best_achievable.iloc[0].copy()
+                selected_row['Feasible'] = False
+                selected_row['Reason'] = 'Target per-user TPS not reached; row shows best achievable per-user TPS'
+            selected_row['TargetTPS'] = target_tps
+            selected_row['TargetLabel'] = f'{target_tps} TPS/user'
+            selected_rows.append(selected_row)
+    return pd.DataFrame(selected_rows)
+
+
+def summarize_feasible_disaggregated_rows(best_rows_df,
+                                          target_metric='TPS_Disagg'):
+    summary_columns = [
+        'Model', 'Config', 'TargetTPS', 'DeviceNum', 'ExtraDevicesNeeded', 'TP',
+        'BatchSize', target_metric, 'Total_Disagg', 'InterStageTotal_ms',
+        'KVCacheGBPerRubinGPU'
+    ]
+    if best_rows_df.empty:
+        return pd.DataFrame(columns=summary_columns)
+    return best_rows_df[best_rows_df['Feasible']][summary_columns].reset_index(drop=True)
+
+
+def generate_groq_rubin72_per_user_results(model_csv='./model.csv',
+                                           gpu_info_csv='./device/gpu_info.csv',
+                                           output_dir='./results',
+                                           output_prefix='groq_rubin72_400k_eval_nvfp4',
+                                           model_names=None,
+                                           ffn_gpu_types=None,
+                                           attn_gpu_type='Rubin-NVL72',
+                                           target_tps_list=None,
+                                           seq_len=400000,
+                                           decode_len=1,
+                                           max_batch_size=32,
+                                           tp_list=None,
+                                           cx9_bw=100,
+                                           cx9_latency=0.005,
+                                           fp8_combine=False):
+    if model_names is None:
+        model_names = []
+    if ffn_gpu_types is None:
+        ffn_gpu_types = ['GROQ3', 'GROQ4', 'GROQ4-stack4']
+    if target_tps_list is None:
+        target_tps_list = [400, 1000]
+    if tp_list is None:
+        tp_list = [1, 2, 4, 8]
+
+    os.makedirs(output_dir, exist_ok=True)
+    model_args_dict = get_model_args_dict(filename=model_csv, model_list=model_names)
+    gpu_dict = get_gpu_info(filename=gpu_info_csv, decoding_mode=True)
+    attn_gpu = gpu_dict[attn_gpu_type]
+
+    all_candidates = []
+    best_rows_list = []
+    for model_name, args in model_args_dict.items():
+        bs_list = list(range(1, max_batch_size + 1))
+        for ffn_gpu_type in ffn_gpu_types:
+            ffn_gpu = gpu_dict[ffn_gpu_type]
+            config_name = f'{ffn_gpu_type}+{attn_gpu_type}'
+            device_counts, min_device_num = groq_candidate_device_counts(args, ffn_gpu)
+            config_candidates = []
+            for device_num in device_counts:
+                gemm_group_per_device = max(1, math.ceil(args.n_routed_experts / device_num))
+                decode_df = decode_disaggregated_time(
+                    args,
+                    attn_gpu,
+                    ffn_gpu,
+                    bs_list,
+                    seq_len,
+                    decode_len,
+                    gemm_group_per_device=gemm_group_per_device,
+                    device_num=device_num,
+                    tp_list=tp_list,
+                    fp8_combine=fp8_combine,
+                    cx9_bw=cx9_bw,
+                    cx9_latency=cx9_latency,
+                    print_console=False,
+                )
+                if decode_df.empty:
+                    continue
+                decode_df['DeviceNum'] = device_num
+                candidate_rows = build_disaggregated_candidate_rows(
+                    args,
+                    model_name,
+                    config_name,
+                    decode_df,
+                    attn_gpu,
+                    ffn_gpu,
+                    seq_len,
+                    decode_len,
+                    min_device_num,
+                    cx9_bw,
+                    cx9_latency,
+                )
+                config_candidates.append(candidate_rows)
+
+            if config_candidates:
+                config_candidate_df = pd.concat(config_candidates).reset_index(drop=True)
+                all_candidates.append(config_candidate_df)
+                best_rows_list.append(
+                    select_best_disaggregated_rows(config_candidate_df, target_tps_list)
+                )
+                continue
+
+            no_candidate_rows = []
+            for target_tps in target_tps_list:
+                no_candidate_rows.append({
+                    'Model': model_name,
+                    'Config': config_name,
+                    'FFN_GPU': ffn_gpu_type,
+                    'Attn_GPU': attn_gpu_type,
+                    'CX9_BW_GBs': cx9_bw,
+                    'CX9_Latency_ms': cx9_latency,
+                    'DeviceNum': np.nan,
+                    'MinGroqDevicesByWeight': min_device_num,
+                    'ExtraDevicesNeeded': np.nan,
+                    'TP': np.nan,
+                    'BatchSize': np.nan,
+                    'WeightGB': decode_ffn_weight_gb(args),
+                    'UsableRubinGB': np.nan,
+                    'KVCacheGBPerRubinGPU': np.nan,
+                    'KVCacheUtilOnRubin': np.nan,
+                    'LoadKV_ms_per_layer': np.nan,
+                    'DenseMLA_ms_per_layer': np.nan,
+                    'DenseMLP_ms_per_layer': np.nan,
+                    'SparseMLA_ms_per_layer': np.nan,
+                    'SharedExpert_ms_per_layer': np.nan,
+                    'RoutedExpert_ms_per_layer': np.nan,
+                    'Dispatch_ms_per_layer': np.nan,
+                    'Combine_ms_per_layer': np.nan,
+                    'InterStage_ms_per_layer': np.nan,
+                    'InterStageTotal_ms': np.nan,
+                    'DenseAttnTotal_ms': np.nan,
+                    'DenseFFNTotal_ms': np.nan,
+                    'SparseAttnTotal_ms': np.nan,
+                    'SharedExpertTotal_ms': np.nan,
+                    'RoutedExpertTotal_ms': np.nan,
+                    'ExposedMoECommTotal_ms': np.nan,
+                    'DenseAttnPct': np.nan,
+                    'DenseFFNPct': np.nan,
+                    'SparseAttnPct': np.nan,
+                    'SharedExpertPct': np.nan,
+                    'RoutedExpertPct': np.nan,
+                    'ExposedMoECommPct': np.nan,
+                    'InterStagePct': np.nan,
+                    'TPOT_Disagg_ms': np.nan,
+                    'TPS_Disagg': np.nan,
+                    'Total_Disagg': np.nan,
+                    'TargetTPS': target_tps,
+                    'Feasible': False,
+                    'Reason': 'No valid batch fits on Rubin72 attention side',
+                    'TargetLabel': f'{target_tps} TPS/user',
+                })
+            best_rows_list.append(pd.DataFrame(no_candidate_rows))
+
+    candidates_df = pd.concat(all_candidates).reset_index(drop=True) if all_candidates else pd.DataFrame()
+    best_rows_df = pd.concat(best_rows_list).reset_index(drop=True) if best_rows_list else pd.DataFrame()
+    feasible_summary_df = summarize_feasible_disaggregated_rows(best_rows_df)
+
+    eval_path = os.path.join(output_dir, f'{output_prefix}.csv')
+    candidate_path = os.path.join(output_dir, f'{output_prefix}_candidates.csv')
+    best_rows_path = os.path.join(output_dir, f'{output_prefix}_best_rows.csv')
+    feasible_summary_path = os.path.join(output_dir, f'{output_prefix}_feasible_summary.csv')
+
+    if not candidates_df.empty:
+        candidates_df.to_csv(candidate_path, index=False)
+    else:
+        pd.DataFrame().to_csv(candidate_path, index=False)
+    if not best_rows_df.empty:
+        best_rows_df.drop(columns=['TargetLabel'], errors='ignore').to_csv(eval_path, index=False)
+        best_rows_df.to_csv(best_rows_path, index=False)
+    else:
+        pd.DataFrame().to_csv(eval_path, index=False)
+        pd.DataFrame().to_csv(best_rows_path, index=False)
+    feasible_summary_df.to_csv(feasible_summary_path, index=False)
+
+    return candidates_df, best_rows_df, feasible_summary_df
+
+
 
 def df_sort(df,value,ascending=False):
     if ascending:
@@ -1444,3 +1858,102 @@ def draw(df, gpu_dict,
             filename = './figures/'+title.replace(' ','_')+'.png'
         plt.savefig(filename,bbox_inches='tight', pad_inches=0.05)
     plt.show()
+
+
+def plot_disagg_stage_stacked_time(df,
+                                   filename,
+                                   label_col='PlotLabel',
+                                   model_csv='./model.csv',
+                                   width=16,
+                                   height=8,
+                                   rotation=45):
+    required_columns = [
+        'Model', 'Config', 'DenseAttnTotal_ms', 'SparseAttnTotal_ms',
+        'Combine_ms_per_layer', 'SharedExpert_ms_per_layer',
+        'Dispatch_ms_per_layer', 'RoutedExpert_ms_per_layer'
+    ]
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    if missing_columns:
+        raise ValueError(f'missing required columns for stage plot: {missing_columns}')
+
+    plot_df = df.copy()
+    model_args_dict = get_model_args_dict(filename=model_csv)
+    sparse_layers = []
+    for model_name in plot_df['Model']:
+        if model_name not in model_args_dict:
+            raise KeyError(f'model {model_name} not found in {model_csv}')
+        model_args = model_args_dict[model_name]
+        sparse_layers.append(model_args.n_layers - model_args.n_dense_layers)
+    plot_df['SparseLayers'] = sparse_layers
+
+    plot_df['SparseAttentionTotal_ms'] = plot_df['SparseAttnTotal_ms'].astype(float)
+    plot_df['CombineTotal_ms'] = (
+        plot_df['Combine_ms_per_layer'].astype(float) * plot_df['SparseLayers']
+    )
+    plot_df['SharedTotal_ms'] = (
+        plot_df['SharedExpert_ms_per_layer'].astype(float) * plot_df['SparseLayers']
+    )
+    plot_df['DispatchTotal_ms'] = (
+        plot_df['Dispatch_ms_per_layer'].astype(float) * plot_df['SparseLayers']
+    )
+    plot_df['RouteTotal_ms'] = (
+        plot_df['RoutedExpert_ms_per_layer'].astype(float) * plot_df['SparseLayers']
+    )
+
+    stage_columns = [
+        ('SparseAtten', 'SparseAttentionTotal_ms'),
+        ('Combine', 'CombineTotal_ms'),
+        ('Shared', 'SharedTotal_ms'),
+        ('Dispatch', 'DispatchTotal_ms'),
+        ('Route', 'RouteTotal_ms'),
+    ]
+
+    if label_col not in plot_df.columns:
+        target_label = plot_df['TargetLabel'] if 'TargetLabel' in plot_df.columns else plot_df['TargetTPS'].astype(str)
+        plot_df[label_col] = plot_df['Model'] + '\n' + plot_df['Config'] + '\n' + target_label
+
+    fig, ax = plt.subplots(figsize=(width, height))
+    x = np.arange(len(plot_df))
+    bottom = np.zeros(len(plot_df))
+    colors = ['#4E79A7', '#F28E2B', '#59A14F', '#E15759', '#76B7B2']
+
+    for (stage_name, column_name), color in zip(stage_columns, colors):
+        values = plot_df[column_name].astype(float).to_numpy()
+        ax.bar(x, values, bottom=bottom, label=stage_name, color=color, width=0.8)
+        bottom += values
+
+    ax.set_ylabel('Time (ms)')
+    ax.set_title('Disaggregated Decode Sparse Stage Time Breakdown')
+    ax.set_xticks(x)
+    ax.set_xticklabels(plot_df[label_col], rotation=rotation, ha='right')
+    ax.legend(ncol=len(stage_columns), loc='upper center', bbox_to_anchor=(0.5, 1.12))
+    ax.grid(axis='y', linestyle='--', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(filename, bbox_inches='tight', pad_inches=0.05)
+    plt.close(fig)
+
+
+def plot_disagg_stage_stacked_time_by_model(df,
+                                            output_dir,
+                                            file_prefix='stage_stacked_time',
+                                            label_col='PlotLabel',
+                                            model_csv='./model.csv',
+                                            width=10,
+                                            height=6,
+                                            rotation=45):
+    os.makedirs(output_dir, exist_ok=True)
+    generated_files = []
+    for model_name, model_df in df.groupby('Model', sort=False):
+        safe_model_name = str(model_name).replace('/', '_').replace(' ', '_').replace('.', '_')
+        filename = os.path.join(output_dir, f'{file_prefix}_{safe_model_name}.png')
+        plot_disagg_stage_stacked_time(
+            model_df.reset_index(drop=True),
+            filename,
+            label_col=label_col,
+            model_csv=model_csv,
+            width=width,
+            height=height,
+            rotation=rotation,
+        )
+        generated_files.append(filename)
+    return generated_files
