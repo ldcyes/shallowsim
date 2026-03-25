@@ -592,6 +592,63 @@ def mla_elapse_time(args: ModelArgs,
     return total, tp_time
 
 
+def decode_attention_component_times(args: ModelArgs,
+                                     gpu: GPU_perf,
+                                     seq_len,
+                                     batchsize,
+                                     tp,
+                                     min_ar_time=0.015,
+                                     discount=0.7,
+                                     kernel_static_time=0.05):
+    if is_gqa_model(args):
+        _, lowp_flops, qk_fp16_flops = gqa_flops(1, seq_len, args, 1)
+        weight_load_ms = gqa_mem(args) / gpu.get_mem_bw()
+    else:
+        _, lowp_flops, qk_fp16_flops = mla_matabsob_flops(1, seq_len, args, 1)
+        weight_load_ms = mla_mem(args) / gpu.get_mem_bw()
+
+    lowp_flops *= batchsize
+    qk_fp16_flops *= batchsize
+
+    if uses_native_fp4(gpu, args):
+        lowp_compute_ms = lowp_flops / gpu.get_fp4_flops()
+    else:
+        lowp_compute_ms = lowp_flops / get_lowp_flops(gpu, gemm_precision(args)) / discount
+    qk_compute_ms = qk_fp16_flops / gpu.get_fp16_flops() / discount
+    compute_ms = lowp_compute_ms + qk_compute_ms
+
+    kv_load_ms = decode_kv_load_time(args, gpu, seq_len, batchsize, tp)
+    all_reduce_comm_size = batchsize * args.dim * 2 / 1024 / 1024
+    all_reduce_ms = all_reduce_comm_size / gpu.get_nvlink_bw() + min_ar_time
+
+    dense_weight_load_ms = weight_load_ms
+    dense_compute_ms = compute_ms
+    dense_overlap_ms = kv_load_ms + max(dense_weight_load_ms, dense_compute_ms)
+
+    sparse_weight_load_ms = weight_load_ms / tp
+    if tp == 1:
+        sparse_compute_ms = compute_ms + kernel_static_time
+    else:
+        sparse_compute_ms = compute_ms / tp + all_reduce_ms + kernel_static_time
+    sparse_overlap_ms = kv_load_ms + max(sparse_weight_load_ms, sparse_compute_ms)
+
+    return {
+        'KVLoad_ms': kv_load_ms,
+        'WeightLoad_ms': weight_load_ms,
+        'ComputeLowp_ms': lowp_compute_ms,
+        'ComputeQK_ms': qk_compute_ms,
+        'Compute_ms': compute_ms,
+        'AllReduce_ms': all_reduce_ms,
+        'KernelStatic_ms': kernel_static_time,
+        'DenseWeightLoad_ms': dense_weight_load_ms,
+        'DenseCompute_ms': dense_compute_ms,
+        'DenseOverlap_ms': dense_overlap_ms,
+        'SparseWeightLoad_ms': sparse_weight_load_ms,
+        'SparseCompute_ms': sparse_compute_ms,
+        'SparseOverlap_ms': sparse_overlap_ms,
+    }
+
+
 def prefill_mla(args: ModelArgs, gpu_dict, seq_len, kv_cache_rate, print_console=False):
     df = pd.DataFrame(columns=['GPU', 'TP1', 'TP4', 'TP8'])
     for key in gpu_dict.keys():
@@ -1494,17 +1551,22 @@ def groq_candidate_device_counts(args: ModelArgs,
         1,
         math.ceil(decode_ffn_weight_gb(args) / (ffn_gpu.mem * weight_util_rate))
     )
+    min_cabinet_num = max(1, math.ceil(min_device_num / ffn_gpu.gpu_per_node))
+    min_device_num = min_cabinet_num * ffn_gpu.gpu_per_node
     if max_device_num is None:
         max_device_num = max(min_device_num, args.n_routed_experts)
     else:
         max_device_num = max(min_device_num, max_device_num)
+    max_cabinet_num = max(min_cabinet_num, math.ceil(max_device_num / ffn_gpu.gpu_per_node))
+    max_device_num = max_cabinet_num * ffn_gpu.gpu_per_node
 
     if min_device_num >= max_device_num:
         return [min_device_num], min_device_num
 
     device_counts = []
     seen_group_counts = set()
-    for device_num in range(min_device_num, max_device_num + 1):
+    for cabinet_num in range(min_cabinet_num, max_cabinet_num + 1):
+        device_num = cabinet_num * ffn_gpu.gpu_per_node
         gemm_group_per_device = max(1, math.ceil(args.n_routed_experts / device_num))
         if gemm_group_per_device in seen_group_counts:
             continue
@@ -1546,8 +1608,11 @@ def build_disaggregated_candidate_rows(args: ModelArgs,
     result_df['CX9_BW_GBs'] = cx9_bw
     result_df['CX9_Latency_ms'] = cx9_latency
     result_df['DeviceNum'] = result_df['DeviceNum'].astype(int)
+    result_df['FFNCabinets'] = np.ceil(result_df['DeviceNum'] / ffn_gpu.gpu_per_node).astype(int)
     result_df['MinGroqDevicesByWeight'] = min_device_num
+    result_df['MinGroqCabinetsByWeight'] = math.ceil(min_device_num / ffn_gpu.gpu_per_node)
     result_df['ExtraDevicesNeeded'] = result_df['DeviceNum'] - min_device_num
+    result_df['ExtraCabinetsNeeded'] = result_df['FFNCabinets'] - result_df['MinGroqCabinetsByWeight']
     result_df['WeightGB'] = decode_ffn_weight_gb(args)
     result_df['UsableRubinGB'] = [
         _disagg_usable_attn_memory_gb(args, attn_gpu, tp)
@@ -1560,6 +1625,23 @@ def build_disaggregated_candidate_rows(args: ModelArgs,
     result_df['KVCacheUtilOnRubin'] = (
         result_df['KVCacheGBPerRubinGPU'] / result_df['UsableRubinGB']
     )
+
+    attn_components = [
+        decode_attention_component_times(args, attn_gpu, seq_len, bs, tp)
+        for tp, bs in zip(result_df['TP'], batch_sizes)
+    ]
+    result_df['AttnKVLoad_ms_per_layer'] = [item['KVLoad_ms'] for item in attn_components]
+    result_df['AttnWeightLoad_ms_per_layer'] = [item['WeightLoad_ms'] for item in attn_components]
+    result_df['AttnCompute_ms_per_layer'] = [item['Compute_ms'] for item in attn_components]
+    result_df['AttnComputeLowp_ms_per_layer'] = [item['ComputeLowp_ms'] for item in attn_components]
+    result_df['AttnComputeQK_ms_per_layer'] = [item['ComputeQK_ms'] for item in attn_components]
+    result_df['AttnAllReduce_ms_per_layer'] = [item['AllReduce_ms'] for item in attn_components]
+    result_df['DenseAttnWeightLoad_ms_per_layer'] = [item['DenseWeightLoad_ms'] for item in attn_components]
+    result_df['DenseAttnCompute_ms_per_layer'] = [item['DenseCompute_ms'] for item in attn_components]
+    result_df['DenseAttnOverlap_ms_per_layer'] = [item['DenseOverlap_ms'] for item in attn_components]
+    result_df['SparseAttnWeightLoad_ms_per_layer'] = [item['SparseWeightLoad_ms'] for item in attn_components]
+    result_df['SparseAttnCompute_ms_per_layer'] = [item['SparseCompute_ms'] for item in attn_components]
+    result_df['SparseAttnOverlap_ms_per_layer'] = [item['SparseOverlap_ms'] for item in attn_components]
 
     result_df['LoadKV_ms_per_layer'] = result_df['LoadKVPerDevice']
     result_df['DenseMLA_ms_per_layer'] = result_df['DenseMLA']
@@ -1575,6 +1657,8 @@ def build_disaggregated_candidate_rows(args: ModelArgs,
     result_df['DenseAttnTotal_ms'] = result_df['DenseMLA_ms_per_layer'] * args.n_dense_layers
     result_df['DenseFFNTotal_ms'] = result_df['DenseMLP_ms_per_layer'] * args.n_dense_layers
     result_df['SparseAttnTotal_ms'] = result_df['SparseMLA_ms_per_layer'] * sparse_layers
+    result_df['DenseAttnOverlapTotal_ms'] = result_df['DenseAttnOverlap_ms_per_layer'] * args.n_dense_layers
+    result_df['SparseAttnOverlapTotal_ms'] = result_df['SparseAttnOverlap_ms_per_layer'] * sparse_layers
     result_df['SharedExpertTotal_ms'] = result_df['SharedExpert_ms_per_layer'] * sparse_layers
     result_df['RoutedExpertTotal_ms'] = result_df['RoutedExpert_ms_per_layer'] * sparse_layers
     result_df['ExposedMoECommTotal_ms'] = np.maximum(result_df['Delta'], 0) * sparse_layers
@@ -1599,6 +1683,89 @@ def build_disaggregated_candidate_rows(args: ModelArgs,
     result_df['SharedExpertVisibleTotal_ms'] = result_df['SharedExpertTotal_ms'] * sparse_ffn_scale
     result_df['RoutedExpertVisibleTotal_ms'] = result_df['RoutedExpertTotal_ms'] * sparse_ffn_scale
     result_df['ExposedMoECommVisibleTotal_ms'] = result_df['ExposedMoECommTotal_ms'] * sparse_ffn_scale
+    result_df['AttenMachineTotal_ms'] = (
+        result_df['DenseAttnTotal_ms'] + result_df['SparseAttnTotal_ms']
+    )
+    result_df['AttenMachineOverlapTotal_ms'] = (
+        result_df['DenseAttnOverlapTotal_ms'] + result_df['SparseAttnOverlapTotal_ms']
+    )
+    result_df['FFNMachineTotal_ms'] = (
+        result_df['DenseFFNTotal_ms']
+        + result_df['SharedExpertTotal_ms']
+        + result_df['RoutedExpertTotal_ms']
+        + result_df['Dispatch_ms_per_layer'] * sparse_layers
+        + result_df['Combine_ms_per_layer'] * sparse_layers
+        + result_df['InterStageTotal_ms']
+    )
+    result_df['DenseStageCritical_AttnOverlap_ms'] = np.maximum(
+        result_df['DenseAttnOverlap_ms_per_layer'],
+        result_df['DenseMLP_ms_per_layer']
+    )
+    result_df['SparseStageCritical_AttnOverlap_ms'] = np.maximum(
+        result_df['SparseAttnOverlap_ms_per_layer'],
+        result_df['SparseFFNCritical']
+    )
+    result_df['TPOT_AttnOverlap_ms'] = (
+        result_df['DenseStageCritical_AttnOverlap_ms'] * args.n_dense_layers
+        + result_df['SparseStageCritical_AttnOverlap_ms'] * sparse_layers
+        + result_df['InterStageTotal_ms']
+    )
+    result_df['TPOT_AttnOverlap_Delta_ms'] = result_df['TPOT_Disagg'] - result_df['TPOT_AttnOverlap_ms']
+
+    dense_attn_overlap_total = result_df['DenseAttnOverlapTotal_ms']
+    sparse_attn_overlap_total = result_df['SparseAttnOverlapTotal_ms']
+    dense_visible_weight = np.maximum(
+        result_df['DenseAttnWeightLoad_ms_per_layer'] - result_df['DenseAttnCompute_ms_per_layer'],
+        0,
+    ) * args.n_dense_layers
+    dense_visible_compute = np.maximum(
+        result_df['DenseAttnCompute_ms_per_layer'] - result_df['DenseAttnWeightLoad_ms_per_layer'],
+        0,
+    ) * args.n_dense_layers
+    sparse_visible_weight = np.maximum(
+        result_df['SparseAttnWeightLoad_ms_per_layer'] - result_df['SparseAttnCompute_ms_per_layer'],
+        0,
+    ) * sparse_layers
+    sparse_visible_compute = np.maximum(
+        result_df['SparseAttnCompute_ms_per_layer'] - result_df['SparseAttnWeightLoad_ms_per_layer'],
+        0,
+    ) * sparse_layers
+    result_df['DenseAttnKVShare'] = np.divide(
+        result_df['AttnKVLoad_ms_per_layer'] * args.n_dense_layers,
+        dense_attn_overlap_total,
+        out=np.zeros(len(result_df), dtype=float),
+        where=dense_attn_overlap_total.astype(float) > 0,
+    )
+    result_df['DenseAttnWeightShare'] = np.divide(
+        dense_visible_weight,
+        dense_attn_overlap_total,
+        out=np.zeros(len(result_df), dtype=float),
+        where=dense_attn_overlap_total.astype(float) > 0,
+    )
+    result_df['DenseAttnComputeShare'] = np.divide(
+        dense_visible_compute,
+        dense_attn_overlap_total,
+        out=np.zeros(len(result_df), dtype=float),
+        where=dense_attn_overlap_total.astype(float) > 0,
+    )
+    result_df['SparseAttnKVShare'] = np.divide(
+        result_df['AttnKVLoad_ms_per_layer'] * sparse_layers,
+        sparse_attn_overlap_total,
+        out=np.zeros(len(result_df), dtype=float),
+        where=sparse_attn_overlap_total.astype(float) > 0,
+    )
+    result_df['SparseAttnWeightShare'] = np.divide(
+        sparse_visible_weight,
+        sparse_attn_overlap_total,
+        out=np.zeros(len(result_df), dtype=float),
+        where=sparse_attn_overlap_total.astype(float) > 0,
+    )
+    result_df['SparseAttnComputeShare'] = np.divide(
+        sparse_visible_compute,
+        sparse_attn_overlap_total,
+        out=np.zeros(len(result_df), dtype=float),
+        where=sparse_attn_overlap_total.astype(float) > 0,
+    )
 
     total_time = (
         result_df['InterStageTotal_ms']
@@ -1619,21 +1786,92 @@ def build_disaggregated_candidate_rows(args: ModelArgs,
 
     ordered_columns = [
         'Model', 'Config', 'FFN_GPU', 'Attn_GPU', 'CX9_BW_GBs', 'CX9_Latency_ms',
-        'DeviceNum', 'MinGroqDevicesByWeight', 'ExtraDevicesNeeded', 'TP', 'BatchSize',
+        'DeviceNum', 'FFNCabinets', 'MinGroqDevicesByWeight', 'MinGroqCabinetsByWeight',
+        'ExtraDevicesNeeded', 'ExtraCabinetsNeeded', 'TP', 'BatchSize',
         'WeightGB', 'UsableRubinGB', 'KVCacheGBPerRubinGPU', 'KVCacheUtilOnRubin',
+        'AttnKVLoad_ms_per_layer', 'AttnWeightLoad_ms_per_layer', 'AttnCompute_ms_per_layer',
+        'AttnComputeLowp_ms_per_layer', 'AttnComputeQK_ms_per_layer', 'AttnAllReduce_ms_per_layer',
+        'DenseAttnWeightLoad_ms_per_layer', 'DenseAttnCompute_ms_per_layer',
+        'DenseAttnOverlap_ms_per_layer', 'SparseAttnWeightLoad_ms_per_layer',
+        'SparseAttnCompute_ms_per_layer', 'SparseAttnOverlap_ms_per_layer',
         'LoadKV_ms_per_layer', 'DenseMLA_ms_per_layer', 'DenseMLP_ms_per_layer',
         'SparseMLA_ms_per_layer', 'SharedExpert_ms_per_layer', 'RoutedExpert_ms_per_layer',
         'Dispatch_ms_per_layer', 'Combine_ms_per_layer', 'InterStage_ms_per_layer',
         'InterStageTotal_ms', 'DenseAttnTotal_ms', 'DenseFFNTotal_ms',
+        'DenseAttnOverlapTotal_ms', 'SparseAttnOverlapTotal_ms',
+        'AttenMachineTotal_ms', 'AttenMachineOverlapTotal_ms', 'FFNMachineTotal_ms',
         'DenseFFNExposedTotal_ms',
         'SparseAttnTotal_ms', 'SharedExpertTotal_ms', 'RoutedExpertTotal_ms',
         'ExposedMoECommTotal_ms', 'SparseFFNTotal_ms', 'SparseFFNExposedTotal_ms',
         'SharedExpertVisibleTotal_ms', 'RoutedExpertVisibleTotal_ms',
         'ExposedMoECommVisibleTotal_ms', 'DenseAttnPct', 'DenseFFNPct', 'SparseAttnPct',
         'SharedExpertPct', 'RoutedExpertPct', 'ExposedMoECommPct', 'InterStagePct',
+        'DenseAttnKVShare', 'DenseAttnWeightShare', 'DenseAttnComputeShare',
+        'SparseAttnKVShare', 'SparseAttnWeightShare', 'SparseAttnComputeShare',
+        'TPOT_AttnOverlap_ms', 'TPOT_AttnOverlap_Delta_ms',
         'TPOT_Disagg', 'TPS_Disagg', 'Total_Disagg'
     ]
     return result_df[ordered_columns].rename(columns={'TPOT_Disagg': 'TPOT_Disagg_ms'})
+
+
+def build_tpot_search_rows(candidate_df,
+                           attn_cabinet_options=None,
+                           tpot_metric='TPOT_Disagg_ms'):
+    if candidate_df.empty:
+        return candidate_df
+    if attn_cabinet_options is None:
+        attn_cabinet_options = [1, 2, 3, 4, 5]
+
+    search_rows = []
+    for _, row in candidate_df.iterrows():
+        atten_machine_total = float(row['AttenMachineTotal_ms'])
+        ffn_machine_total = float(row['FFNMachineTotal_ms'])
+        ffn_cabinets = int(row['FFNCabinets'])
+        for attn_cabinets in attn_cabinet_options:
+            if attn_cabinets <= 0:
+                continue
+            search_row = row.copy()
+            search_row['AttnCabinets'] = int(attn_cabinets)
+            search_row['FFNCabinets'] = ffn_cabinets
+            search_row['CabinetRatio'] = f'{attn_cabinets}:{ffn_cabinets}'
+            ratio_gcd = math.gcd(attn_cabinets, ffn_cabinets)
+            search_row['CabinetRatioSimplified'] = (
+                f'{attn_cabinets // ratio_gcd}:{ffn_cabinets // ratio_gcd}'
+            )
+            search_row['ClusterTPOT_ms'] = max(
+                atten_machine_total / attn_cabinets,
+                ffn_machine_total / ffn_cabinets,
+            )
+            attn_machine_overlap_total = float(search_row['AttenMachineOverlapTotal_ms'])
+            search_row['ClusterTPOT_AttnOverlap_ms'] = max(
+                attn_machine_overlap_total / attn_cabinets,
+                ffn_machine_total / ffn_cabinets,
+            )
+            search_row['ClusterTPS'] = 1000 / search_row['ClusterTPOT_ms']
+            search_row['ClusterTPS_AttnOverlap'] = 1000 / search_row['ClusterTPOT_AttnOverlap_ms']
+            search_rows.append(search_row)
+
+    search_df = pd.DataFrame(search_rows)
+    return search_df
+
+
+def search_best_tpot_rows(candidate_df,
+                          attn_cabinet_options=None,
+                          tpot_metric='TPOT_Disagg_ms'):
+    search_df = build_tpot_search_rows(candidate_df,
+                                       attn_cabinet_options=attn_cabinet_options,
+                                       tpot_metric=tpot_metric)
+    if search_df.empty:
+        return search_df
+
+    best_rows = []
+    for (model_name, config_name), group_df in search_df.groupby(['Model', 'Config'], sort=False):
+        sorted_group = group_df.sort_values(
+            ['ClusterTPOT_ms', 'AttnCabinets', 'FFNCabinets', tpot_metric, 'BatchSize', 'TP'],
+            ascending=[True, True, True, True, True, True]
+        ).reset_index(drop=True)
+        best_rows.append(sorted_group.iloc[0].copy())
+    return pd.DataFrame(best_rows)
 
 
 def select_best_disaggregated_rows(candidate_df,
@@ -1691,6 +1929,7 @@ def generate_groq_rubin72_per_user_results(model_csv='./model.csv',
                                            seq_len=400000,
                                            decode_len=1,
                                            max_batch_size=32,
+                                           max_attn_cabinets=5,
                                            tp_list=None,
                                            cx9_bw=100,
                                            cx9_latency=0.005,
@@ -1821,11 +2060,21 @@ def generate_groq_rubin72_per_user_results(model_csv='./model.csv',
     candidates_df = pd.concat(all_candidates).reset_index(drop=True) if all_candidates else pd.DataFrame()
     best_rows_df = pd.concat(best_rows_list).reset_index(drop=True) if best_rows_list else pd.DataFrame()
     feasible_summary_df = summarize_feasible_disaggregated_rows(best_rows_df)
+    all_tpot_search_df = build_tpot_search_rows(
+        candidates_df,
+        attn_cabinet_options=list(range(1, max_attn_cabinets + 1)),
+    ) if not candidates_df.empty else pd.DataFrame()
+    best_tpot_df = search_best_tpot_rows(
+        candidates_df,
+        attn_cabinet_options=list(range(1, max_attn_cabinets + 1)),
+    ) if not candidates_df.empty else pd.DataFrame()
 
     eval_path = os.path.join(output_dir, f'{output_prefix}.csv')
     candidate_path = os.path.join(output_dir, f'{output_prefix}_candidates.csv')
     best_rows_path = os.path.join(output_dir, f'{output_prefix}_best_rows.csv')
     feasible_summary_path = os.path.join(output_dir, f'{output_prefix}_feasible_summary.csv')
+    all_tpot_search_path = os.path.join(output_dir, f'{output_prefix}_all_tpot_search.csv')
+    best_tpot_path = os.path.join(output_dir, f'{output_prefix}_best_tpot.csv')
 
     if not candidates_df.empty:
         candidates_df.to_csv(candidate_path, index=False)
@@ -1838,6 +2087,8 @@ def generate_groq_rubin72_per_user_results(model_csv='./model.csv',
         pd.DataFrame().to_csv(eval_path, index=False)
         pd.DataFrame().to_csv(best_rows_path, index=False)
     feasible_summary_df.to_csv(feasible_summary_path, index=False)
+    all_tpot_search_df.to_csv(all_tpot_search_path, index=False)
+    best_tpot_df.to_csv(best_tpot_path, index=False)
 
     return candidates_df, best_rows_df, feasible_summary_df
 
@@ -1999,7 +2250,9 @@ def plot_disagg_stage_stacked_time(df,
 
     if label_col not in plot_df.columns:
         has_multiple_models = plot_df['Model'].nunique() > 1
-        if 'FFN_GPU' in plot_df.columns:
+        if 'FFN_GPU' in plot_df.columns and 'CabinetRatioSimplified' in plot_df.columns:
+            base_label = plot_df['FFN_GPU'].astype(str) + '\n' + plot_df['CabinetRatioSimplified'].astype(str)
+        elif 'FFN_GPU' in plot_df.columns:
             base_label = plot_df['FFN_GPU'].astype(str)
         else:
             base_label = plot_df['Config'].astype(str)
