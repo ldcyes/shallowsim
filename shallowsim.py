@@ -12,10 +12,10 @@ import seaborn as sns
 from typing import Tuple, Optional, Literal
 
 cm = sns.light_palette("red", as_cmap=True)
-NVL_GPU_LIST = [72, 144, 576]
+NVL_GPU_LIST = [72, 144, 288,576]
 NVFP4_BITS_PER_PARAM = 4.5
 NVFP4_BYTES_PER_PARAM = NVFP4_BITS_PER_PARAM / 8
-MXFP8_BITS_PER_PARAM = 8
+MXFP8_BITS_PER_PARAM = 8.25
 MXFP8_BYTES_PER_PARAM = MXFP8_BITS_PER_PARAM / 8
 BF16_BITS_PER_PARAM = 16
 BF16_BYTES_PER_PARAM = BF16_BITS_PER_PARAM / 8
@@ -27,7 +27,7 @@ PRECISION_BYTES_PER_PARAM = {
 
 class ModelArgs:
     max_batch_size: int = 8
-    max_seq_len: int = 4096 * 4
+    max_seq_len: int = 1024*1024*1024
     vocab_size: int = 129280
     dim: int = 7168
     inter_dim: int = 18432
@@ -288,7 +288,7 @@ def is_gqa_model(args: ModelArgs):
 
 
 def gqa_head_dim(args: ModelArgs):
-    return args.qk_nope_head_dim + args.qk_rope_head_dim
+    return args.dim / args.n_kv_heads
 
 
 def gqa_kv_cache_dim(args: ModelArgs):
@@ -442,7 +442,7 @@ def decode_kv_cache_storage_multiplier(args: ModelArgs, tp):
 
 def decode_kv_cache_load_divisor(args: ModelArgs, tp):
     if is_gqa_model(args):
-        return max(1, tp)
+        return tp
     return 1
 
 
@@ -483,8 +483,8 @@ def mla_flops(q_len, kv_len, args: ModelArgs, kv_cache_rate):
                              + q_len * args.qk_nope_head_dim * kv_len)  # QK_score_nope
     score_v = args.n_heads * q_len * kv_len * args.v_head_dim  # ScoreV
     wo = q_len * args.n_heads * args.v_head_dim * args.dim  # wo
-    lowp_flops = (lowp_sum + score_v + wo) * 2 / 1e9
-    qk_fp16_flops = qk_sum * 2 / 1e9
+    lowp_flops = (lowp_sum + wo) * 2 / 1e9
+    qk_fp16_flops = (qk_sum+score_v) * 2 / 1e9
 
     return lowp_flops + qk_fp16_flops, lowp_flops, qk_fp16_flops
 
@@ -511,8 +511,8 @@ def mla_matabsob_flops(q_len, kv_len, args: ModelArgs, kv_cache_rate=0):
 
     attn_up_proj = q_len * args.n_heads * args.v_head_dim * args.kv_lora_rank
     o_proj = q_len * args.n_heads * args.v_head_dim * args.dim
-    lowp_flops = (lowp_sum + score_v + attn_up_proj + o_proj) * 2 / 1e9
-    qk_fp16_flops = qk_sum * 2 / 1e9
+    lowp_flops = (lowp_sum + o_proj) * 2 / 1e9
+    qk_fp16_flops = (qk_sum + score_v + attn_up_proj) * 2 / 1e9
 
     return lowp_flops + qk_fp16_flops, lowp_flops, qk_fp16_flops
 
@@ -779,7 +779,7 @@ def prefill_time(args: ModelArgs, gpu_dict, seq_len, kv_cache_rate, tp, dp, prin
 # Decoding
 
 
-def decode_other_parameter_gb(args: ModelArgs):
+def decode_other_parameter_gb(args: ModelArgs, include_ffn_params=True):
     """Estimate non-attention, non-expert resident parameters in GB.
 
     This includes:
@@ -791,21 +791,32 @@ def decode_other_parameter_gb(args: ModelArgs):
     sparse_layer_num = args.n_layers - args.n_dense_layers
     param_bytes = PRECISION_BYTES_PER_PARAM[param_precision(args)]
     embedding_and_head_gb = 2 * args.vocab_size * args.dim * param_bytes / 1024 / 1024 / 1024
-    dense_mlp_gb = densmlp_mem(args) * args.n_dense_layers / 1024
-    router_gb = sparse_layer_num * args.dim * args.n_routed_experts * param_bytes / 1024 / 1024 / 1024
     norm_gb = ((2 * args.n_layers) + 1) * args.dim * param_bytes / 1024 / 1024 / 1024
+    if include_ffn_params:
+        dense_mlp_gb = densmlp_mem(args) * args.n_dense_layers / 1024
+        router_gb = sparse_layer_num * args.dim * args.n_routed_experts * param_bytes / 1024 / 1024 / 1024
+    else:
+        dense_mlp_gb = 0
+        router_gb = 0
     return embedding_and_head_gb + dense_mlp_gb + router_gb + norm_gb
 
 
-def _decoding_batchsize(args: ModelArgs, gpu: GPU_perf, seq_len, decode_len, tp, expert_num):
+def _decoding_batchsize(args: ModelArgs,
+                        gpu: GPU_perf,
+                        seq_len,
+                        decode_len,
+                        tp,
+                        expert_num,
+                        include_ffn_params=True):
     mem_util_rate = 0.9  # torch/activation等其它开销的折扣
     attn_param = attn_mem(args)
-    expert_mem = moe_expert_mem(args)  # expert参数，单位MB
-    others_parameter = decode_other_parameter_gb(args)
+    expert_mem = moe_expert_mem(args) if include_ffn_params else 0  # expert参数，单位MB
+    others_parameter = decode_other_parameter_gb(args, include_ffn_params=include_ffn_params)
     kv_cache = decode_kv_cache_bytes(args, seq_len, decode_len, tp)
     mem = gpu.mem * mem_util_rate - others_parameter - attn_param * args.n_layers / tp / 1024
-    mem -= expert_mem * \
-        (args.n_layers - args.n_dense_layers) * expert_num / 1024
+    if include_ffn_params:
+        mem -= expert_mem * \
+            (args.n_layers - args.n_dense_layers) * expert_num / 1024
     return mem * 1024 * 1024 * 1024 / kv_cache
 
 
@@ -819,7 +830,7 @@ def decode_ffn_weight_gb(args: ModelArgs):
 
 def min_cabinet_count_for_decode_ffn(args: ModelArgs,
                                      gpu: GPU_perf,
-                                     weight_util_rate=0.9):
+                                     weight_util_rate=0.95):
     cabinet_mem_gb = gpu.mem * gpu.gpu_per_node * weight_util_rate
     return max(1, math.ceil(decode_ffn_weight_gb(args) / cabinet_mem_gb))
 
@@ -853,6 +864,7 @@ def decode_batchsize(args: ModelArgs, gpu_dict, seq_len, decode_len, tp):
 
 def decode_mla(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len,
                expert_num=2,
+               include_ffn_params=True,
                tp_list=None,
                print_console=False):
     df = pd.DataFrame(columns=['GPU', 'BatchSize',
@@ -869,7 +881,9 @@ def decode_mla(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len,
                                                     enable_gemm_fp4=True)
             for tp_num in tp_list:
                 max_bs = _decoding_batchsize(
-                    args, gpu_dict[key], seq_len, decode_len, expert_num=expert_num, tp=tp_num)
+                    args, gpu_dict[key], seq_len, decode_len,
+                    expert_num=expert_num, tp=tp_num,
+                    include_ffn_params=include_ffn_params)
                 if bs > max_bs:
                     continue
                 else:
@@ -885,6 +899,7 @@ def decode_mla(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len,
 
 def decode_gqa(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len,
                expert_num=2,
+               include_ffn_params=True,
                tp_list=None,
                print_console=False):
     df = pd.DataFrame(columns=['GPU', 'BatchSize',
@@ -901,7 +916,9 @@ def decode_gqa(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len,
                                                       enable_gemm_fp4=True)
             for tp_num in tp_list:
                 max_bs = _decoding_batchsize(
-                    args, gpu_dict[key], seq_len, decode_len, expert_num=expert_num, tp=tp_num)
+                    args, gpu_dict[key], seq_len, decode_len,
+                    expert_num=expert_num, tp=tp_num,
+                    include_ffn_params=include_ffn_params)
                 if bs > max_bs:
                     continue
                 load_kv_time = decode_kv_load_time(
@@ -1285,6 +1302,7 @@ def decode_disaggregated_time(args: ModelArgs,
     mla = decode_attention(args, {attn_gpu.gpu_type: attn_gpu},
                            bs_list, seq_len, decode_len,
                            expert_num=expert_per_device,
+                           include_ffn_params=False,
                            tp_list=tp_list)
     dense_mlp = decode_dense_mlp(args, {ffn_gpu.gpu_type: ffn_gpu},
                                  bs_list, seq_len, decode_len,
@@ -1315,12 +1333,6 @@ def decode_disaggregated_time(args: ModelArgs,
                  moe[['BatchSize', 'TP', 'SharedExpert', 'RoutedExpert']],
                  a2a[['BatchSize', 'TP', 'Dispatch', 'Combine']]])
 
-    def overlap_adjust(r):
-        if r['Delta'] > 0:
-            return r['TPOT_O'] + r['Delta'] * (args.n_layers - args.n_dense_layers)
-        else:
-            return r['TPOT_O']
-
     df['Attn_GPU'] = attn_gpu.gpu_type
     df['FFN_GPU'] = ffn_gpu.gpu_type
     df['DenseMLA'] = df['DenseMLA'] + df['LoadKVPerDevice']
@@ -1328,10 +1340,13 @@ def decode_disaggregated_time(args: ModelArgs,
     df['COMP_SUM'] = df['SparseMLA'] + df['SharedExpert'] + df['RoutedExpert']
     df['COMM_SUM'] = df['Dispatch'] + df['Combine']
     df['Delta'] = df['COMM_SUM'] - df['SparseMLA'] - df['SharedExpert']
-    df['TPOT_O'] = (df['DenseMLA'] + df['DenseMLP']) * args.n_dense_layers
-    df['TPOT_O'] += (df['SparseMLA'] + df['SharedExpert'] +
-                     df['RoutedExpert']) * (args.n_layers - args.n_dense_layers)
-    df['TPOT'] = df.apply(lambda row: overlap_adjust(row), axis=1)
+    sparse_layers = args.n_layers - args.n_dense_layers
+    df['DenseStageCritical'] = np.maximum(df['DenseMLA'], df['DenseMLP'])
+    df['SparseFFNCritical'] = df['SharedExpert'] + df['RoutedExpert'] + np.maximum(df['Delta'], 0)
+    df['SparseStageCritical'] = np.maximum(df['SparseMLA'], df['SparseFFNCritical'])
+    df['TPOT_O'] = df['DenseStageCritical'] * args.n_dense_layers
+    df['TPOT_O'] += df['SparseStageCritical'] * sparse_layers
+    df['TPOT'] = df['TPOT_O']
 
     batch_sizes = df['BatchSize'].astype(int)
     df['InterStage'] = [inter_stage_link_time(bs, args, tp, link_bw=cx9_bw,
@@ -1350,7 +1365,8 @@ def decode_disaggregated_time(args: ModelArgs,
     df = df[df['TPS_Disagg'] > tps_limit]
     order = ['Attn_GPU', 'FFN_GPU', 'TP', 'BatchSize', 'LoadKVPerDevice', 'DenseMLA', 'DenseMLP',
              'SparseMLA', 'Combine', 'SharedExpert', 'RoutedExpert', 'Dispatch',
-             'InterStage', 'COMP_SUM', 'COMM_SUM', 'Delta', 'TPOT', 'TPOT_O',
+             'InterStage', 'COMP_SUM', 'COMM_SUM', 'Delta', 'DenseStageCritical',
+             'SparseFFNCritical', 'SparseStageCritical', 'TPOT', 'TPOT_O',
              'TPOT_Disagg', 'TPS', 'TPS_O', 'TPS_Disagg', 'Total', 'Total_O',
              'Total_Disagg', 'Comm_Impact', 'Disagg_Impact']
     df = df[order]
@@ -1375,6 +1391,20 @@ def profile_rubin_nvl72_disaggregated(args: ModelArgs,
 
     Prefill attention/FFN and decode attention stay on one Rubin-NVL72 cabinet.
     Decode FFN is placed on one or more Rubin-NVL72 cabinets connected via CX9.
+
+    Decode totals follow AF split critical-path semantics:
+    - dense layers use max(attention, FFN)
+    - sparse layers use max(attention, FFN + exposed MoE comm)
+    - inter-stage link time is added on top of the decode critical path
+
+    KV placement semantics remain model-dependent:
+    - MLA replicates one full KV copy on each TP attention GPU
+    - GQA shards KV evenly across TP attention GPUs
+
+    Returns:
+        Tuple[pd.DataFrame, pd.DataFrame]:
+            prefill summary and decode summary. The decode DataFrame includes
+            DenseStageCritical, SparseFFNCritical, and SparseStageCritical.
     """
     if tp_list is None:
         tp_list = [1, 2, 4, 8]
@@ -1436,7 +1466,18 @@ def profile_rubin_nvl72_disaggregated(args: ModelArgs,
         decode_df = pd.concat(decode_frames).reset_index(drop=True)
     else:
         decode_df = pd.DataFrame(columns=['Attn_GPU', 'FFN_GPU', 'TP', 'BatchSize',
-                                          'FFN_Cabinets', 'FFN_Min_Cabinets'])
+                                          'LoadKVPerDevice', 'DenseMLA', 'DenseMLP',
+                                          'SparseMLA', 'Combine', 'SharedExpert',
+                                          'RoutedExpert', 'Dispatch', 'InterStage',
+                                          'COMP_SUM', 'COMM_SUM', 'Delta',
+                                          'DenseStageCritical', 'SparseFFNCritical',
+                                          'SparseStageCritical', 'TPOT', 'TPOT_O',
+                                          'TPOT_Disagg', 'TPS', 'TPS_O', 'TPS_Disagg',
+                                          'Total', 'Total_O', 'Total_Disagg',
+                                          'Comm_Impact', 'Disagg_Impact',
+                                          'FFN_Cabinets', 'FFN_Min_Cabinets',
+                                          'Weight_Headroom', 'CX9_BW_GBs',
+                                          'CX9_Latency_ms'])
 
     if print_console:
         print(prefill_df.to_markdown(floatfmt='.3f'))
@@ -1479,7 +1520,7 @@ def _disagg_usable_attn_memory_gb(args: ModelArgs,
                                   tp):
     mem_util_rate = 0.9
     attn_param_gb = attn_mem(args) * args.n_layers / tp / 1024
-    return mem_util_rate * attn_gpu.mem - decode_other_parameter_gb(args) - attn_param_gb
+    return mem_util_rate * attn_gpu.mem - decode_other_parameter_gb(args, include_ffn_params=False) - attn_param_gb
 
 
 def build_disaggregated_candidate_rows(args: ModelArgs,
@@ -1537,22 +1578,43 @@ def build_disaggregated_candidate_rows(args: ModelArgs,
     result_df['SharedExpertTotal_ms'] = result_df['SharedExpert_ms_per_layer'] * sparse_layers
     result_df['RoutedExpertTotal_ms'] = result_df['RoutedExpert_ms_per_layer'] * sparse_layers
     result_df['ExposedMoECommTotal_ms'] = np.maximum(result_df['Delta'], 0) * sparse_layers
+    result_df['DenseFFNExposedTotal_ms'] = np.maximum(
+        result_df['DenseFFNTotal_ms'] - result_df['DenseAttnTotal_ms'], 0
+    )
+    result_df['SparseFFNTotal_ms'] = (
+        result_df['SharedExpertTotal_ms']
+        + result_df['RoutedExpertTotal_ms']
+        + result_df['ExposedMoECommTotal_ms']
+    )
+    result_df['SparseFFNExposedTotal_ms'] = np.maximum(
+        result_df['SparseFFNTotal_ms'] - result_df['SparseAttnTotal_ms'], 0
+    )
+
+    sparse_ffn_scale = np.divide(
+        result_df['SparseFFNExposedTotal_ms'],
+        result_df['SparseFFNTotal_ms'],
+        out=np.zeros(len(result_df), dtype=float),
+        where=result_df['SparseFFNTotal_ms'].astype(float) > 0,
+    )
+    result_df['SharedExpertVisibleTotal_ms'] = result_df['SharedExpertTotal_ms'] * sparse_ffn_scale
+    result_df['RoutedExpertVisibleTotal_ms'] = result_df['RoutedExpertTotal_ms'] * sparse_ffn_scale
+    result_df['ExposedMoECommVisibleTotal_ms'] = result_df['ExposedMoECommTotal_ms'] * sparse_ffn_scale
 
     total_time = (
         result_df['InterStageTotal_ms']
         + result_df['DenseAttnTotal_ms']
-        + result_df['DenseFFNTotal_ms']
+        + result_df['DenseFFNExposedTotal_ms']
         + result_df['SparseAttnTotal_ms']
-        + result_df['SharedExpertTotal_ms']
-        + result_df['RoutedExpertTotal_ms']
-        + result_df['ExposedMoECommTotal_ms']
+        + result_df['SharedExpertVisibleTotal_ms']
+        + result_df['RoutedExpertVisibleTotal_ms']
+        + result_df['ExposedMoECommVisibleTotal_ms']
     )
     result_df['DenseAttnPct'] = result_df['DenseAttnTotal_ms'] / total_time
-    result_df['DenseFFNPct'] = result_df['DenseFFNTotal_ms'] / total_time
+    result_df['DenseFFNPct'] = result_df['DenseFFNExposedTotal_ms'] / total_time
     result_df['SparseAttnPct'] = result_df['SparseAttnTotal_ms'] / total_time
-    result_df['SharedExpertPct'] = result_df['SharedExpertTotal_ms'] / total_time
-    result_df['RoutedExpertPct'] = result_df['RoutedExpertTotal_ms'] / total_time
-    result_df['ExposedMoECommPct'] = result_df['ExposedMoECommTotal_ms'] / total_time
+    result_df['SharedExpertPct'] = result_df['SharedExpertVisibleTotal_ms'] / total_time
+    result_df['RoutedExpertPct'] = result_df['RoutedExpertVisibleTotal_ms'] / total_time
+    result_df['ExposedMoECommPct'] = result_df['ExposedMoECommVisibleTotal_ms'] / total_time
     result_df['InterStagePct'] = result_df['InterStageTotal_ms'] / total_time
 
     ordered_columns = [
@@ -1563,8 +1625,11 @@ def build_disaggregated_candidate_rows(args: ModelArgs,
         'SparseMLA_ms_per_layer', 'SharedExpert_ms_per_layer', 'RoutedExpert_ms_per_layer',
         'Dispatch_ms_per_layer', 'Combine_ms_per_layer', 'InterStage_ms_per_layer',
         'InterStageTotal_ms', 'DenseAttnTotal_ms', 'DenseFFNTotal_ms',
+        'DenseFFNExposedTotal_ms',
         'SparseAttnTotal_ms', 'SharedExpertTotal_ms', 'RoutedExpertTotal_ms',
-        'ExposedMoECommTotal_ms', 'DenseAttnPct', 'DenseFFNPct', 'SparseAttnPct',
+        'ExposedMoECommTotal_ms', 'SparseFFNTotal_ms', 'SparseFFNExposedTotal_ms',
+        'SharedExpertVisibleTotal_ms', 'RoutedExpertVisibleTotal_ms',
+        'ExposedMoECommVisibleTotal_ms', 'DenseAttnPct', 'DenseFFNPct', 'SparseAttnPct',
         'SharedExpertPct', 'RoutedExpertPct', 'ExposedMoECommPct', 'InterStagePct',
         'TPOT_Disagg', 'TPS_Disagg', 'Total_Disagg'
     ]
@@ -1726,10 +1791,16 @@ def generate_groq_rubin72_per_user_results(model_csv='./model.csv',
                     'InterStageTotal_ms': np.nan,
                     'DenseAttnTotal_ms': np.nan,
                     'DenseFFNTotal_ms': np.nan,
+                    'DenseFFNExposedTotal_ms': np.nan,
                     'SparseAttnTotal_ms': np.nan,
                     'SharedExpertTotal_ms': np.nan,
                     'RoutedExpertTotal_ms': np.nan,
                     'ExposedMoECommTotal_ms': np.nan,
+                    'SparseFFNTotal_ms': np.nan,
+                    'SparseFFNExposedTotal_ms': np.nan,
+                    'SharedExpertVisibleTotal_ms': np.nan,
+                    'RoutedExpertVisibleTotal_ms': np.nan,
+                    'ExposedMoECommVisibleTotal_ms': np.nan,
                     'DenseAttnPct': np.nan,
                     'DenseFFNPct': np.nan,
                     'SparseAttnPct': np.nan,
@@ -1869,14 +1940,22 @@ def plot_disagg_stage_stacked_time(df,
                                    rotation=45):
     required_columns = [
         'Model', 'Config', 'DenseAttnTotal_ms', 'SparseAttnTotal_ms',
-        'Combine_ms_per_layer', 'SharedExpert_ms_per_layer',
-        'Dispatch_ms_per_layer', 'RoutedExpert_ms_per_layer'
+        'DenseFFNTotal_ms', 'SharedExpertTotal_ms', 'RoutedExpertTotal_ms',
+        'Dispatch_ms_per_layer', 'Combine_ms_per_layer', 'InterStageTotal_ms'
     ]
     missing_columns = [col for col in required_columns if col not in df.columns]
     if missing_columns:
         raise ValueError(f'missing required columns for stage plot: {missing_columns}')
 
     plot_df = df.copy()
+    if 'TPOT_Disagg_ms' in plot_df.columns:
+        sort_columns = ['Model', 'Config', 'TPOT_Disagg_ms', 'DeviceNum', 'BatchSize', 'TP']
+        sort_columns = [col for col in sort_columns if col in plot_df.columns]
+        plot_df = plot_df.sort_values(sort_columns, ascending=True, na_position='last')
+    dedup_columns = [col for col in ['Model', 'Config', 'FFN_GPU', 'Attn_GPU'] if col in plot_df.columns]
+    if dedup_columns:
+        plot_df = plot_df.drop_duplicates(subset=dedup_columns, keep='first').reset_index(drop=True)
+
     model_args_dict = get_model_args_dict(filename=model_csv)
     sparse_layers = []
     for model_name in plot_df['Model']:
@@ -1886,47 +1965,96 @@ def plot_disagg_stage_stacked_time(df,
         sparse_layers.append(model_args.n_layers - model_args.n_dense_layers)
     plot_df['SparseLayers'] = sparse_layers
 
-    plot_df['SparseAttentionTotal_ms'] = plot_df['SparseAttnTotal_ms'].astype(float)
-    plot_df['CombineTotal_ms'] = (
-        plot_df['Combine_ms_per_layer'].astype(float) * plot_df['SparseLayers']
-    )
-    plot_df['SharedTotal_ms'] = (
-        plot_df['SharedExpert_ms_per_layer'].astype(float) * plot_df['SparseLayers']
-    )
     plot_df['DispatchTotal_ms'] = (
         plot_df['Dispatch_ms_per_layer'].astype(float) * plot_df['SparseLayers']
     )
-    plot_df['RouteTotal_ms'] = (
-        plot_df['RoutedExpert_ms_per_layer'].astype(float) * plot_df['SparseLayers']
+    plot_df['CombineTotal_ms'] = (
+        plot_df['Combine_ms_per_layer'].astype(float) * plot_df['SparseLayers']
+    )
+    plot_df['AttenMachineTotal_ms'] = (
+        plot_df['DenseAttnTotal_ms'].astype(float)
+        + plot_df['SparseAttnTotal_ms'].astype(float)
+    )
+    plot_df['FFNMachineTotal_ms'] = (
+        plot_df['DenseFFNTotal_ms'].astype(float)
+        + plot_df['SharedExpertTotal_ms'].astype(float)
+        + plot_df['RoutedExpertTotal_ms'].astype(float)
+        + plot_df['DispatchTotal_ms'].astype(float)
+        + plot_df['CombineTotal_ms'].astype(float)
+        + plot_df['InterStageTotal_ms'].astype(float)
     )
 
-    stage_columns = [
-        ('SparseAtten', 'SparseAttentionTotal_ms'),
-        ('Combine', 'CombineTotal_ms'),
-        ('Shared', 'SharedTotal_ms'),
-        ('Dispatch', 'DispatchTotal_ms'),
-        ('Route', 'RouteTotal_ms'),
+    atten_stage_columns = [
+        ('DenseAtten', 'DenseAttnTotal_ms', '#4E79A7'),
+        ('SparseAtten', 'SparseAttnTotal_ms', '#59A14F'),
+    ]
+    ffn_stage_columns = [
+        ('DenseFFN', 'DenseFFNTotal_ms', '#F28E2B'),
+        ('Shared', 'SharedExpertTotal_ms', '#E15759'),
+        ('Route', 'RoutedExpertTotal_ms', '#76B7B2'),
+        ('Dispatch', 'DispatchTotal_ms', '#EDC948'),
+        ('Combine', 'CombineTotal_ms', '#B07AA1'),
+        ('CX9', 'InterStageTotal_ms', '#FF9DA7'),
     ]
 
     if label_col not in plot_df.columns:
-        target_label = plot_df['TargetLabel'] if 'TargetLabel' in plot_df.columns else plot_df['TargetTPS'].astype(str)
-        plot_df[label_col] = plot_df['Model'] + '\n' + plot_df['Config'] + '\n' + target_label
+        has_multiple_models = plot_df['Model'].nunique() > 1
+        if 'FFN_GPU' in plot_df.columns:
+            base_label = plot_df['FFN_GPU'].astype(str)
+        else:
+            base_label = plot_df['Config'].astype(str)
+        if has_multiple_models:
+            plot_df[label_col] = plot_df['Model'] + '\n' + base_label
+        else:
+            plot_df[label_col] = base_label
 
     fig, ax = plt.subplots(figsize=(width, height))
     x = np.arange(len(plot_df))
-    bottom = np.zeros(len(plot_df))
-    colors = ['#4E79A7', '#F28E2B', '#59A14F', '#E15759', '#76B7B2']
+    bar_width = 0.36
+    atten_x = x - bar_width / 2
+    ffn_x = x + bar_width / 2
 
-    for (stage_name, column_name), color in zip(stage_columns, colors):
+    atten_bottom = np.zeros(len(plot_df))
+    for stage_name, column_name, color in atten_stage_columns:
         values = plot_df[column_name].astype(float).to_numpy()
-        ax.bar(x, values, bottom=bottom, label=stage_name, color=color, width=0.8)
-        bottom += values
+        ax.bar(atten_x, values, bottom=atten_bottom, label=stage_name, color=color, width=bar_width)
+        atten_bottom += values
+
+    ffn_bottom = np.zeros(len(plot_df))
+    for stage_name, column_name, color in ffn_stage_columns:
+        values = plot_df[column_name].astype(float).to_numpy()
+        ax.bar(ffn_x, values, bottom=ffn_bottom, label=stage_name, color=color, width=bar_width)
+        ffn_bottom += values
+
+    y_max = max(float(np.max(atten_bottom)) if len(atten_bottom) else 0.0,
+                float(np.max(ffn_bottom)) if len(ffn_bottom) else 0.0,
+                1.0)
+    pair_gap = y_max * 0.035
+    pair_text_gap = y_max * 0.08
+
+    for idx in range(len(plot_df)):
+        ax.text(atten_x[idx], atten_bottom[idx], 'ATTEN', ha='center', va='bottom', fontsize=8, rotation=90)
+        ax.text(ffn_x[idx], ffn_bottom[idx], 'FFN', ha='center', va='bottom', fontsize=8, rotation=90)
+        ax.text(atten_x[idx], atten_bottom[idx] + pair_gap,
+                f"{plot_df['AttenMachineTotal_ms'].iat[idx]:.3f} ms",
+                ha='center', va='bottom', fontsize=8)
+        ax.text(ffn_x[idx], ffn_bottom[idx] + pair_gap,
+                f"{plot_df['FFNMachineTotal_ms'].iat[idx]:.3f} ms",
+                ha='center', va='bottom', fontsize=8)
+        if 'TPOT_Disagg_ms' in plot_df.columns:
+            pair_top = max(atten_bottom[idx], ffn_bottom[idx])
+            ax.text(x[idx], pair_top + pair_text_gap,
+                    f"TPOT {plot_df['TPOT_Disagg_ms'].iat[idx]:.3f} ms",
+                    ha='center', va='bottom', fontsize=8, fontweight='bold')
+
+    ax.set_ylim(0, max(atten_bottom.max() if len(atten_bottom) else 0,
+                       ffn_bottom.max() if len(ffn_bottom) else 0) + y_max * 0.18)
 
     ax.set_ylabel('Time (ms)')
-    ax.set_title('Disaggregated Decode Sparse Stage Time Breakdown')
+    ax.set_title('Disaggregated Decode Machine Time Breakdown')
     ax.set_xticks(x)
     ax.set_xticklabels(plot_df[label_col], rotation=rotation, ha='right')
-    ax.legend(ncol=len(stage_columns), loc='upper center', bbox_to_anchor=(0.5, 1.12))
+    ax.legend(ncol=4, loc='upper center', bbox_to_anchor=(0.5, 1.18))
     ax.grid(axis='y', linestyle='--', alpha=0.3)
     plt.tight_layout()
     plt.savefig(filename, bbox_inches='tight', pad_inches=0.05)

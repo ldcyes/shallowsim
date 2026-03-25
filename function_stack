@@ -1,0 +1,63 @@
+静态函数调用栈
+
+目标入口
+- generate_groq_rubin72_per_user_results [shallowsim.py:1658]
+
+主调用树
+generate_groq_rubin72_per_user_results
+|- get_model_args_dict [shallowsim.py:137]
+|  |- _build_model_args_from_row [shallowsim.py:106]
+|  |  |- _get_row_value [shallowsim.py:98]
+|- get_gpu_info [shallowsim.py:209]
+|- groq_candidate_device_counts [shallowsim.py:1481]
+|  |- decode_ffn_weight_gb [shallowsim.py:823]
+|  |  |- densmlp_mem [shallowsim.py:630]
+|  |  |- moe_expert_mem [shallowsim.py:659]
+|- decode_disaggregated_time [shallowsim.py:1284]
+|  |- decode_attention [shallowsim.py:922]
+|  |  |- is_gqa_model [shallowsim.py:286]
+|  |  |- 分支 A: decode_gqa [shallowsim.py:900]
+|  |  |  |- gqa_elapse_time [shallowsim.py:379]
+|  |  |  |- _decoding_batchsize [shallowsim.py:804]
+|  |  |  |  |- decode_other_parameter_gb [shallowsim.py:782]
+|  |  |  |  |  |- include_ffn_params=False 时，AF attention 侧不计入 dense MLP/router/expert 权重
+|  |  |  |  |- attn_mem [shallowsim.py:425]
+|  |  |  |  |- decode_kv_cache_bytes [shallowsim.py:449]
+|  |  |  |- decode_kv_load_time [shallowsim.py:455]
+|  |  |  |- GQA KV 语义：KV cache 在 TP attention GPU 间均匀切分
+|  |  |- 分支 B: decode_mla [shallowsim.py:865]
+|  |     |- mla_elapse_time [shallowsim.py:533]
+|  |     |- _decoding_batchsize [shallowsim.py:804]
+|  |     |- decode_kv_load_time [shallowsim.py:455]
+|  |     |- MLA KV 语义：每个 TP attention GPU 保留一整份 KV
+|  |- decode_dense_mlp [shallowsim.py:929]
+|  |  |- _prefill_dense_mlp [shallowsim.py:634]
+|  |- decode_moe_expert [shallowsim.py:1059]
+|  |  |- _decode_moe_expert [shallowsim.py:985]
+|  |  |  |- moe_expert_mem [shallowsim.py:659]
+|  |  |  |- uses_native_fp4 [shallowsim.py:350]
+|  |  |  |- gemm_precision [shallowsim.py:327]
+|  |  |  |- get_lowp_flops [shallowsim.py:341]
+|  |  |  |- n_pow2_range [shallowsim.py:959]
+|  |  |  |- moe_expert_flops [shallowsim.py:655]
+|  |- decode_a2a [shallowsim.py:1117]
+|  |  |- _moe_a2a [shallowsim.py:1095]
+|  |- inter_stage_link_time [shallowsim.py:838]
+|  |- 关键路径组合
+|     |- DenseStageCritical = max(DenseMLA, DenseMLP)
+|     |- SparseFFNCritical = SharedExpert + RoutedExpert + max(Delta, 0)
+|     |- SparseStageCritical = max(SparseMLA, SparseFFNCritical)
+|     |- TPOT_Disagg = DenseStageCritical * n_dense_layers
+|     |                 + SparseStageCritical * n_sparse_layers
+|     |                 + InterStage * n_layers
+|- build_disaggregated_candidate_rows [shallowsim.py:1501]
+|  |- 生成 DenseFFNExposedTotal_ms / SparseFFNExposedTotal_ms
+|  |- 生成 SharedExpertVisibleTotal_ms / RoutedExpertVisibleTotal_ms / ExposedMoECommVisibleTotal_ms
+|  |- 绘图与占比只统计关键路径上真正暴露的 FFN 时间
+|- select_best_disaggregated_rows [shallowsim.py:1616]
+|- summarize_feasible_disaggregated_rows [shallowsim.py:1648]
+
+说明
+1. 这是静态调用栈，不是运行时真实栈帧转储。
+2. AF 分离下，attention 与 FFN 是并行关系；计算 TPOT_Disagg 和绘图时不能简单把两支时间相加。
+3. generate_groq_rubin72_per_user_results 内部的 DataFrame 拼接、过滤、排序和 CSV 写出属于库调用，未继续展开。
