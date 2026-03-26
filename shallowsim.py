@@ -402,12 +402,12 @@ def gqa_flops(q_len, kv_len, args: ModelArgs, kv_cache_rate):
     k_proj = k_proj * (1 - kv_cache_rate)
     v_proj = v_proj * (1 - kv_cache_rate)
     lowp_sum = q_proj + k_proj + v_proj + o_proj
-    qk_fp16_sum = args.n_heads * q_len * gqa_head_dim(args) * kv_len
+    highp_sum = args.n_heads * q_len * gqa_head_dim(args) * kv_len
     score_v = args.n_heads * q_len * kv_len * args.v_head_dim
 
     lowp_flops = lowp_sum * 2 / 1e9
-    qk_fp16_flops = (qk_fp16_sum + score_v) * 2 / 1e9
-    return lowp_flops + qk_fp16_flops, lowp_flops, qk_fp16_flops
+    highp_flops = (highp_sum + score_v) * 2 / 1e9
+    return lowp_flops + highp_flops, lowp_flops, highp_flops
 
 
 def gqa_mem(args: ModelArgs):
@@ -432,19 +432,19 @@ def gqa_elapse_time(args: ModelArgs,
                     cp=1,
                     print_console=False):
     if decoding_mode:
-        _, lowp_flops, qk_fp16_flops = gqa_flops(1, seq_len, args, 1)
+        _, lowp_flops, highp_flops = gqa_flops(1, seq_len, args, 1)
         lowp_flops *= batchsize
-        qk_fp16_flops *= batchsize
+        highp_flops *= batchsize
     else:
-        _, lowp_flops, qk_fp16_flops = gqa_flops(seq_len, seq_len, args, kv_cache_rate)
+        _, lowp_flops, highp_flops = gqa_flops(seq_len, seq_len, args, kv_cache_rate)
 
     lowp_t = lowp_flops / get_lowp_flops(gpu, gemm_precision(args)) / gqa_discount
-    qk_fp16_t = qk_fp16_flops / get_attn_flops(gpu, args) / gqa_discount / cp
+    highp_t = highp_flops / get_attn_flops(gpu, args) / gqa_discount / cp
     load_t = gqa_mem(args) / gpu.get_mem_bw()
 
-    total = lowp_t + qk_fp16_t + load_t
+    total = lowp_t + highp_t + load_t
     if enable_gemm_fp4 and uses_native_fp4(gpu, args):
-        total = lowp_flops / gpu.get_fp4_flops() + qk_fp16_t + load_t
+        total = lowp_flops / gpu.get_fp4_flops() + highp_t + load_t
 
     ring_comm_t = ring_attention_comm_time(args, gpu, batchsize, cp) if decoding_mode else 0.0
     ar_len = batchsize if decoding_mode else seq_len
@@ -461,8 +461,8 @@ def gqa_elapse_time(args: ModelArgs,
     if print_console:
         print("[%8s]GQA_%s Elapsed time(ms): %.3f" %
               (gpu.gpu_type, gemm_precision(args), lowp_t))
-        print("[%8s]GQA_QK_FP16 Elapsed time(ms): %.3f" %
-              (gpu.gpu_type, qk_fp16_t))
+        print("[%8s]GQA_HIGHP Elapsed time(ms): %.3f" %
+              (gpu.gpu_type, highp_t))
     return total, tp_time
 
 
@@ -546,9 +546,9 @@ def mla_flops(q_len, kv_len, args: ModelArgs, kv_cache_rate):
     score_v = args.n_heads * q_len * kv_len * args.v_head_dim  # ScoreV
     wo = q_len * args.n_heads * args.v_head_dim * args.dim  # wo
     lowp_flops = (lowp_sum + wo) * 2 / 1e9
-    qk_fp16_flops = (qk_sum+score_v) * 2 / 1e9
+    highp_flops = (qk_sum+score_v) * 2 / 1e9
 
-    return lowp_flops + qk_fp16_flops, lowp_flops, qk_fp16_flops
+    return lowp_flops + highp_flops, lowp_flops, highp_flops
 
 # 矩阵吸收的版本
 
@@ -574,9 +574,9 @@ def mla_matabsob_flops(q_len, kv_len, args: ModelArgs, kv_cache_rate=0):
     attn_up_proj = q_len * args.n_heads * args.v_head_dim * args.kv_lora_rank
     o_proj = q_len * args.n_heads * args.v_head_dim * args.dim
     lowp_flops = (lowp_sum + o_proj) * 2 / 1e9
-    qk_fp16_flops = (qk_sum + score_v + attn_up_proj) * 2 / 1e9
+    highp_flops = (qk_sum + score_v + attn_up_proj) * 2 / 1e9
 
-    return lowp_flops + qk_fp16_flops, lowp_flops, qk_fp16_flops
+    return lowp_flops + highp_flops, lowp_flops, highp_flops
 
 
 def mla_mem(args: ModelArgs):
@@ -607,28 +607,28 @@ def mla_elapse_time(args: ModelArgs,
                     print_console=False):
     if decoding_mode:
         # Decoding时计算为qlen=1, kv_cache_rate = 1
-        _, lowp_flops, qk_fp16_flops = mla_matabsob_flops(
+        _, lowp_flops, highp_flops = mla_matabsob_flops(
             1, seq_len, args, 1)
         lowp_flops *= batchsize
-        qk_fp16_flops *= batchsize
+        highp_flops *= batchsize
     else:
         # prefill阶段使用非吸收的版本
-        _, lowp_flops, qk_fp16_flops = mla_flops(
+        _, lowp_flops, highp_flops = mla_flops(
             seq_len, seq_len, args, kv_cache_rate)
     lowp_t = lowp_flops / get_lowp_flops(gpu, gemm_precision(args)) / mla_discount
-    qk_fp16_t = qk_fp16_flops / get_attn_flops(gpu, args) / mla_discount / cp
+    highp_t = highp_flops / get_attn_flops(gpu, args) / mla_discount / cp
 
     # load weight
     load_t = mla_mem(args) / gpu.get_mem_bw()
 
-    total = lowp_t + qk_fp16_t + load_t
+    total = lowp_t + highp_t + load_t
 
     if enable_gemm_fp4:
         if gemm_precision(args) == 'NVFP4' and gpu.get_fp4_flops() == 0:
             if print_console:
                 print('[%8s]This GPU does not support FP4' % gpu.gpu_type)
         elif uses_native_fp4(gpu, args):
-            total = lowp_flops / gpu.get_fp4_flops() + qk_fp16_t + load_t
+            total = lowp_flops / gpu.get_fp4_flops() + highp_t + load_t
 
     ring_comm_t = ring_attention_comm_time(args, gpu, batchsize, cp) if decoding_mode else 0.0
     ar_len = batchsize if decoding_mode else seq_len
@@ -645,8 +645,8 @@ def mla_elapse_time(args: ModelArgs,
     if print_console:
           print("[%8s]%s Elapsed time(ms): %.3f" %
               (gpu.gpu_type, gemm_precision(args), lowp_t))
-          print("[%8s]QK_FP16 Elapsed time(ms): %.3f" %
-              (gpu.gpu_type, qk_fp16_t))
+          print("[%8s]HIGHP Elapsed time(ms): %.3f" %
+              (gpu.gpu_type, highp_t))
           print("[%8s]Total Elapsed time(ms):%.3f" % (gpu.gpu_type, total))
           print("[%8s]AR Elapsed time(ms):%.3f" % (gpu.gpu_type, all_reduce_t))
           for v in tp:
@@ -666,20 +666,20 @@ def decode_attention_component_times(args: ModelArgs,
                                      kernel_static_time=ATTN_KERNEL_STATIC_MS,
                                      cp=1):
     if is_gqa_model(args):
-        _, lowp_flops, qk_fp16_flops = gqa_flops(1, seq_len, args, 1)
+        _, lowp_flops, highp_flops = gqa_flops(1, seq_len, args, 1)
         weight_load_ms = gqa_mem(args) / gpu.get_mem_bw()
     else:
-        _, lowp_flops, qk_fp16_flops = mla_matabsob_flops(1, seq_len, args, 1)
+        _, lowp_flops, highp_flops = mla_matabsob_flops(1, seq_len, args, 1)
         weight_load_ms = mla_mem(args) / gpu.get_mem_bw()
 
     lowp_flops *= batchsize
-    qk_fp16_flops *= batchsize
+    highp_flops *= batchsize
 
     if uses_native_fp4(gpu, args):
         lowp_compute_ms = lowp_flops / gpu.get_fp4_flops()
     else:
         lowp_compute_ms = lowp_flops / get_lowp_flops(gpu, gemm_precision(args)) / discount
-    qk_compute_ms = qk_fp16_flops / get_attn_flops(gpu, args) / discount / cp
+    qk_compute_ms = highp_flops / get_attn_flops(gpu, args) / discount / cp
     compute_ms = lowp_compute_ms + qk_compute_ms
     ring_comm_ms = ring_attention_comm_time(args, gpu, batchsize, cp)
 
@@ -689,14 +689,16 @@ def decode_attention_component_times(args: ModelArgs,
 
     dense_weight_load_ms = weight_load_ms
     dense_compute_ms = compute_ms
-    dense_overlap_ms = kv_load_ms + max(dense_weight_load_ms, dense_compute_ms) + ring_comm_ms
+    dense_mem_ms = kv_load_ms + dense_weight_load_ms  # share HBM bandwidth
+    dense_overlap_ms = max(dense_mem_ms, dense_compute_ms) + ring_comm_ms
 
     sparse_weight_load_ms = weight_load_ms / tp
     if tp == 1:
         sparse_compute_ms = compute_ms + kernel_static_time
     else:
         sparse_compute_ms = compute_ms / tp + all_reduce_ms + kernel_static_time
-    sparse_overlap_ms = kv_load_ms + max(sparse_weight_load_ms, sparse_compute_ms) + ring_comm_ms
+    sparse_mem_ms = kv_load_ms + sparse_weight_load_ms  # share HBM bandwidth
+    sparse_overlap_ms = max(sparse_mem_ms, sparse_compute_ms) + ring_comm_ms
 
     return {
         'KVLoad_ms': kv_load_ms,
@@ -1374,13 +1376,15 @@ def decode_time(args: ModelArgs, gpu_dict,
     df['TPOT'] = df.apply(lambda row:  overlap_adjust(row), axis=1)
     df = df[['GPU', 'TP', 'BatchSize', 'LoadKVPerDevice', 'DenseMLA', 'DenseMLP', 'SparseMLA', 'Combine',
              'SharedExpert', 'RoutedExpert', 'Dispatch', 'COMP_SUM', 'COMM_SUM', 'Delta', 'TPOT', 'TPOT_O']]
-    df['TPS'] = 1000 / df['TPOT']
-    df['TPS_O'] = 1000 / df['TPOT_O']
-    df['Total'] = df['TPS'] * df['BatchSize'].astype(int)
-    df['Total_O'] = df['TPS_O'] * df['BatchSize'].astype(int)
-    df['Comm_Impact'] = (df['Total_O'] - df['Total']) / df['Total_O']
+    df['TPS_USER'] = 1000 / df['TPOT']
+    df['TPS_USER_O'] = 1000 / df['TPOT_O']
+    # Note: decode_time is for non-disaggregated (single GPU type), DP not applied here
+    # as gpu_per_node info is not available in this path
+    df['TPS_GPU'] = df['TPS_USER'] * df['BatchSize'].astype(int)
+    df['TPS_GPU_O'] = df['TPS_USER_O'] * df['BatchSize'].astype(int)
+    df['Comm_Impact'] = (df['TPS_GPU_O'] - df['TPS_GPU']) / df['TPS_GPU_O']
 
-    df = df[df['TPS'] > tps_limit]
+    df = df[df['TPS_USER'] > tps_limit]
     if print_console:
         print(df.set_index('GPU').T.to_markdown(floatfmt=".3f"))
     return df
@@ -1409,8 +1413,8 @@ def decode_time_with_ep_list(args: ModelArgs, gpu_dict,
     dd.reset_index(inplace=True, drop=True)
     order = ['GPU', 'TP', 'EP', 'BatchSize', 'LoadKVPerDevice', 'DenseMLA', 'DenseMLP', 'SparseMLA',
              'Combine', 'SharedExpert', 'RoutedExpert', 'Dispatch', 'COMP_SUM',
-             'COMM_SUM', 'Delta', 'TPOT', 'TPOT_O', 'TPS', 'TPS_O', 'Total',
-             'Total_O', 'Comm_Impact']
+             'COMM_SUM', 'Delta', 'TPOT', 'TPOT_O', 'TPS_USER', 'TPS_USER_O', 'TPS_GPU',
+             'TPS_GPU_O', 'Comm_Impact']
     dd = dd[order]
     dd['BatchSize'] = dd['BatchSize'].astype(int)
     return dd
@@ -1421,7 +1425,7 @@ def df_filter(df,gpu,device_num=0, bs=0,tps_limit=0, value_list=[]):
     if bs > 0:
         df_o = df_o[df_o['BatchSize'] == str(bs)]
     if tps_limit > 0:
-        df_o = df_o[df_o['TPS'] > tps_limit]
+        df_o = df_o[df_o['TPS_USER'] > tps_limit]
     if device_num > 0:
         df_o = df_o[df_o['EP'] == device_num]
     if len(value_list) > 0:
@@ -1503,26 +1507,32 @@ def decode_disaggregated_time(args: ModelArgs,
     df['TPOT'] = df['TPOT_O']
 
     batch_sizes = df['BatchSize'].astype(int)
+    df['DP'] = (attn_gpu.gpu_per_node / (df['TP'] * cp)).astype(int).clip(lower=1)
     df['InterStage'] = [inter_stage_link_time(bs, args, tp, link_bw=cx9_bw,
                                               link_latency=cx9_latency)
                         for bs, tp in zip(batch_sizes, df['TP'])]
     df['TPOT_Disagg'] = df['TPOT'] + df['InterStage'] * args.n_layers
-    df['TPS'] = 1000 / df['TPOT']
-    df['TPS_O'] = 1000 / df['TPOT_O']
-    df['TPS_Disagg'] = 1000 / df['TPOT_Disagg']
-    df['Total'] = df['TPS'] * batch_sizes
-    df['Total_O'] = df['TPS_O'] * batch_sizes
-    df['Total_Disagg'] = df['TPS_Disagg'] * batch_sizes
-    df['Comm_Impact'] = (df['Total_O'] - df['Total']) / df['Total_O']
-    df['Disagg_Impact'] = (df['Total'] - df['Total_Disagg']) / df['Total']
+    df['TPS_USER'] = 1000 / df['TPOT']
+    df['TPS_USER_O'] = 1000 / df['TPOT_O']
+    df['TPS_USER_Disagg'] = 1000 / df['TPOT_Disagg']
+    df['TPS_GPU'] = df['TPS_USER'] * batch_sizes
+    df['TPS_GPU_O'] = df['TPS_USER_O'] * batch_sizes
+    df['TPS_GPU_Disagg'] = df['TPS_USER_Disagg'] * batch_sizes
+    df['TPS_Cluster_GPU'] = df['TPS_GPU'] * df['DP']
+    df['TPS_Cluster_GPU_O'] = df['TPS_GPU_O'] * df['DP']
+    df['TPS_Cluster_GPU_Disagg'] = df['TPS_GPU_Disagg'] * df['DP']
+    df['Comm_Impact'] = (df['TPS_Cluster_GPU_O'] - df['TPS_Cluster_GPU']) / df['TPS_Cluster_GPU_O']
+    df['Disagg_Impact'] = (df['TPS_Cluster_GPU'] - df['TPS_Cluster_GPU_Disagg']) / df['TPS_Cluster_GPU']
 
-    df = df[df['TPS_Disagg'] > tps_limit]
-    order = ['Attn_GPU', 'FFN_GPU', 'TP', 'BatchSize', 'LoadKVPerDevice', 'DenseMLA', 'DenseMLP',
+    df = df[df['TPS_USER_Disagg'] > tps_limit]
+    order = ['Attn_GPU', 'FFN_GPU', 'TP', 'DP', 'BatchSize', 'LoadKVPerDevice', 'DenseMLA', 'DenseMLP',
              'SparseMLA', 'Combine', 'SharedExpert', 'RoutedExpert', 'Dispatch',
              'InterStage', 'COMP_SUM', 'COMM_SUM', 'Delta', 'DenseStageCritical',
              'SparseFFNCritical', 'SparseStageCritical', 'TPOT', 'TPOT_O',
-             'TPOT_Disagg', 'TPS', 'TPS_O', 'TPS_Disagg', 'Total', 'Total_O',
-             'Total_Disagg', 'Comm_Impact', 'Disagg_Impact']
+             'TPOT_Disagg', 'TPS_USER', 'TPS_USER_O', 'TPS_USER_Disagg',
+             'TPS_GPU', 'TPS_GPU_O', 'TPS_GPU_Disagg',
+             'TPS_Cluster_GPU', 'TPS_Cluster_GPU_O', 'TPS_Cluster_GPU_Disagg',
+             'Comm_Impact', 'Disagg_Impact']
     df = df[order]
     if print_console:
         print(df.to_markdown(floatfmt='.3f'))
@@ -1619,15 +1629,17 @@ def profile_rubin_nvl72_disaggregated(args: ModelArgs,
     if decode_frames:
         decode_df = pd.concat(decode_frames).reset_index(drop=True)
     else:
-        decode_df = pd.DataFrame(columns=['Attn_GPU', 'FFN_GPU', 'TP', 'BatchSize',
+        decode_df = pd.DataFrame(columns=['Attn_GPU', 'FFN_GPU', 'TP', 'DP', 'BatchSize',
                                           'LoadKVPerDevice', 'DenseMLA', 'DenseMLP',
                                           'SparseMLA', 'Combine', 'SharedExpert',
                                           'RoutedExpert', 'Dispatch', 'InterStage',
                                           'COMP_SUM', 'COMM_SUM', 'Delta',
                                           'DenseStageCritical', 'SparseFFNCritical',
                                           'SparseStageCritical', 'TPOT', 'TPOT_O',
-                                          'TPOT_Disagg', 'TPS', 'TPS_O', 'TPS_Disagg',
-                                          'Total', 'Total_O', 'Total_Disagg',
+                                          'TPOT_Disagg', 'TPS_USER', 'TPS_USER_O',
+                                          'TPS_USER_Disagg', 'TPS_GPU', 'TPS_GPU_O',
+                                          'TPS_GPU_Disagg', 'TPS_Cluster_GPU',
+                                          'TPS_Cluster_GPU_O', 'TPS_Cluster_GPU_Disagg',
                                           'Comm_Impact', 'Disagg_Impact',
                                           'FFN_Cabinets', 'FFN_Min_Cabinets',
                                           'Weight_Headroom', 'CX9_BW_GBs',
@@ -1885,7 +1897,7 @@ def build_disaggregated_candidate_rows(args: ModelArgs,
     ordered_columns = [
         'Model', 'Config', 'FFN_GPU', 'Attn_GPU', 'CX9_BW_GBs', 'CX9_Latency_ms',
         'DeviceNum', 'FFNCabinets', 'MinGroqDevicesByWeight', 'MinGroqCabinetsByWeight',
-        'ExtraDevicesNeeded', 'ExtraCabinetsNeeded', 'TP', 'BatchSize',
+        'ExtraDevicesNeeded', 'ExtraCabinetsNeeded', 'TP', 'DP', 'BatchSize',
         'WeightGB', 'UsableRubinGB', 'KVCacheGBPerRubinGPU', 'KVCacheUtilOnRubin',
         'AttnKVLoad_ms_per_layer', 'AttnWeightLoad_ms_per_layer', 'AttnCompute_ms_per_layer',
         'AttnComputeLowp_ms_per_layer', 'AttnComputeQK_ms_per_layer', 'AttnAllReduce_ms_per_layer',
@@ -1907,7 +1919,7 @@ def build_disaggregated_candidate_rows(args: ModelArgs,
         'DenseAttnKVShare', 'DenseAttnWeightShare', 'DenseAttnComputeShare',
         'SparseAttnKVShare', 'SparseAttnWeightShare', 'SparseAttnComputeShare',
         'TPOT_AttnOverlap_ms', 'TPOT_AttnOverlap_Delta_ms',
-        'TPOT_Disagg', 'TPS_Disagg', 'Total_Disagg'
+        'TPOT_Disagg', 'TPS_USER_Disagg', 'TPS_GPU_Disagg', 'TPS_Cluster_GPU_Disagg'
     ]
     return result_df[ordered_columns].rename(columns={'TPOT_Disagg': 'TPOT_Disagg_ms'})
 
@@ -1945,8 +1957,10 @@ def build_tpot_search_rows(candidate_df,
                 attn_machine_overlap_total / attn_cabinets,
                 ffn_machine_total / ffn_cabinets,
             )
-            search_row['ClusterTPS'] = 1000 / search_row['ClusterTPOT_ms']
-            search_row['ClusterTPS_AttnOverlap'] = 1000 / search_row['ClusterTPOT_AttnOverlap_ms']
+            bs = int(search_row['BatchSize'])
+            dp = int(search_row['DP']) if 'DP' in search_row.index else 1
+            search_row['ClusterTPS'] = 1000 / search_row['ClusterTPOT_ms'] * bs * dp * attn_cabinets
+            search_row['ClusterTPS_AttnOverlap'] = 1000 / search_row['ClusterTPOT_AttnOverlap_ms'] * bs * dp * attn_cabinets
             search_rows.append(search_row)
 
     search_df = pd.DataFrame(search_rows)
@@ -1974,7 +1988,7 @@ def search_best_tpot_rows(candidate_df,
 
 def select_best_disaggregated_rows(candidate_df,
                                    target_tps_list,
-                                   target_metric='TPS_Disagg'):
+                                   target_metric='TPS_USER_Disagg'):
     if candidate_df.empty:
         return candidate_df
 
@@ -2005,10 +2019,10 @@ def select_best_disaggregated_rows(candidate_df,
 
 
 def summarize_feasible_disaggregated_rows(best_rows_df,
-                                          target_metric='TPS_Disagg'):
+                                          target_metric='TPS_USER_Disagg'):
     summary_columns = [
-        'Model', 'Config', 'TargetTPS', 'DeviceNum', 'ExtraDevicesNeeded', 'TP',
-        'BatchSize', target_metric, 'Total_Disagg', 'InterStageTotal_ms',
+        'Model', 'Config', 'TargetTPS', 'DeviceNum', 'ExtraDevicesNeeded', 'TP', 'DP',
+        'BatchSize', target_metric, 'TPS_Cluster_GPU_Disagg', 'InterStageTotal_ms',
         'KVCacheGBPerRubinGPU'
     ]
     if best_rows_df.empty:
@@ -2116,6 +2130,7 @@ def generate_groq_rubin72_per_user_results(model_csv='./model.csv',
                     'MinGroqDevicesByWeight': min_device_num,
                     'ExtraDevicesNeeded': np.nan,
                     'TP': np.nan,
+                    'DP': np.nan,
                     'BatchSize': np.nan,
                     'WeightGB': decode_ffn_weight_gb(args),
                     'UsableRubinGB': np.nan,
@@ -2151,8 +2166,9 @@ def generate_groq_rubin72_per_user_results(model_csv='./model.csv',
                     'ExposedMoECommPct': np.nan,
                     'InterStagePct': np.nan,
                     'TPOT_Disagg_ms': np.nan,
-                    'TPS_Disagg': np.nan,
-                    'Total_Disagg': np.nan,
+                    'TPS_USER_Disagg': np.nan,
+                    'TPS_GPU_Disagg': np.nan,
+                    'TPS_Cluster_GPU_Disagg': np.nan,
                     'TargetTPS': target_tps,
                     'Feasible': False,
                     'Reason': 'No valid batch fits on Rubin72 attention side',
