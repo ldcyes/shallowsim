@@ -29,21 +29,21 @@ PRECISION_BYTES_PER_PARAM = {
 # Configurable simulation constants (all latency / time values in ms)
 # ====================================================================
 # Attention kernel efficiency vs peak FLOPS (FlashMLA/FlashAttn on H800)
-ATTN_KERNEL_DISCOUNT = 0.7
+ATTN_KERNEL_DISCOUNT = 1.0
 # Kernel launch + misc overhead per attention layer (ms)
-ATTN_KERNEL_STATIC_MS = 0.05
+ATTN_KERNEL_STATIC_MS = 0.005
 # AllReduce minimum static latency (ms)
-ALLREDUCE_LATENCY_MS = 0.015
+ALLREDUCE_LATENCY_MS = 0.005
 # NVLink ring single-hop latency for CP ring attention (ms)
-RING_HOP_LATENCY_MS = 5e-7
+RING_HOP_LATENCY_MS = 0.005
 # MoE decode All-to-All static latency per micro-batch (ms)
 MOE_A2A_LATENCY_MS = 0.005
 # Prefill All-to-All static latency (ms)
-PREFILL_A2A_LATENCY_MS = 5e-7
+PREFILL_A2A_LATENCY_MS = 0.005
 # MoE decode micro-batch size
 MOE_DECODE_MBS = 2
 # Memory utilization rate (torch / activation overhead discount)
-MEM_UTIL_RATE = 0.9
+MEM_UTIL_RATE = 0.95
 # Weight storage utilization for capacity planning
 WEIGHT_UTIL_RATE = 0.95
 # CX9 interconnect defaults
