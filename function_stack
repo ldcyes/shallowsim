@@ -5,15 +5,20 @@
 
 主调用树
 generate_groq_rubin72_per_user_results
+
 |- get_model_args_dict [shallowsim.py:137]
 |  |- _build_model_args_from_row [shallowsim.py:106]
 |  |  |- _get_row_value [shallowsim.py:98]
+
 |- get_gpu_info [shallowsim.py:209]
+
 |- groq_candidate_device_counts [shallowsim.py:1481]
 |  |- decode_ffn_weight_gb [shallowsim.py:823]
 |  |  |- densmlp_mem [shallowsim.py:630]
 |  |  |- moe_expert_mem [shallowsim.py:659]
+
 |- decode_disaggregated_time [shallowsim.py:1284]
+
 |  |- decode_attention [shallowsim.py:922]
 |  |  |- is_gqa_model [shallowsim.py:286]
 |  |  |- 分支 A: decode_gqa [shallowsim.py:900]
@@ -30,8 +35,10 @@ generate_groq_rubin72_per_user_results
 |  |     |- _decoding_batchsize [shallowsim.py:804]
 |  |     |- decode_kv_load_time [shallowsim.py:455]
 |  |     |- MLA KV 语义：每个 TP attention GPU 保留一整份 KV
+
 |  |- decode_dense_mlp [shallowsim.py:929]
 |  |  |- _prefill_dense_mlp [shallowsim.py:634]
+
 |  |- decode_moe_expert [shallowsim.py:1059]
 |  |  |- _decode_moe_expert [shallowsim.py:985]
 |  |  |  |- moe_expert_mem [shallowsim.py:659]
@@ -40,9 +47,12 @@ generate_groq_rubin72_per_user_results
 |  |  |  |- get_lowp_flops [shallowsim.py:341]
 |  |  |  |- n_pow2_range [shallowsim.py:959]
 |  |  |  |- moe_expert_flops [shallowsim.py:655]
+
 |  |- decode_a2a [shallowsim.py:1117]
 |  |  |- _moe_a2a [shallowsim.py:1095]
+
 |  |- inter_stage_link_time [shallowsim.py:838]
+
 |  |- 关键路径组合
 |     |- DenseStageCritical = max(DenseMLA, DenseMLP)
 |     |- SparseFFNCritical = SharedExpert + RoutedExpert + max(Delta, 0)
@@ -50,11 +60,14 @@ generate_groq_rubin72_per_user_results
 |     |- TPOT_Disagg = DenseStageCritical * n_dense_layers
 |     |                 + SparseStageCritical * n_sparse_layers
 |     |                 + InterStage * n_layers
+
 |- build_disaggregated_candidate_rows [shallowsim.py:1501]
 |  |- 生成 DenseFFNExposedTotal_ms / SparseFFNExposedTotal_ms
 |  |- 生成 SharedExpertVisibleTotal_ms / RoutedExpertVisibleTotal_ms / ExposedMoECommVisibleTotal_ms
 |  |- 绘图与占比只统计关键路径上真正暴露的 FFN 时间
+
 |- select_best_disaggregated_rows [shallowsim.py:1616]
+
 |- summarize_feasible_disaggregated_rows [shallowsim.py:1648]
 
 说明

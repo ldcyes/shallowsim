@@ -25,6 +25,32 @@ PRECISION_BYTES_PER_PARAM = {
     'BF16': BF16_BYTES_PER_PARAM,
 }
 
+# ====================================================================
+# Configurable simulation constants (all latency / time values in ms)
+# ====================================================================
+# Attention kernel efficiency vs peak FLOPS (FlashMLA/FlashAttn on H800)
+ATTN_KERNEL_DISCOUNT = 0.7
+# Kernel launch + misc overhead per attention layer (ms)
+ATTN_KERNEL_STATIC_MS = 0.05
+# AllReduce minimum static latency (ms)
+ALLREDUCE_LATENCY_MS = 0.015
+# NVLink ring single-hop latency for CP ring attention (ms)
+RING_HOP_LATENCY_MS = 5e-7
+# MoE decode All-to-All static latency per micro-batch (ms)
+MOE_A2A_LATENCY_MS = 0.005
+# Prefill All-to-All static latency (ms)
+PREFILL_A2A_LATENCY_MS = 5e-7
+# MoE decode micro-batch size
+MOE_DECODE_MBS = 2
+# Memory utilization rate (torch / activation overhead discount)
+MEM_UTIL_RATE = 0.9
+# Weight storage utilization for capacity planning
+WEIGHT_UTIL_RATE = 0.95
+# CX9 interconnect defaults
+CX9_BW_GBS = 100
+CX9_LATENCY_MS = 0.005
+CX9_MAX_LINK_RAILS = 8
+
 class ModelArgs:
     max_batch_size: int = 8
     max_seq_len: int = 1024*1024*1024
@@ -58,6 +84,7 @@ class ModelArgs:
     beta_slow: int = 1
     mscale: float = 1.
     attn_type: str = 'MLA'
+    attn_dtype: str = 'MXFP8'
     param_dtype: str = 'NVFP4'
     kv_cache_dtype: str = 'NVFP4'
     gemm_dtype: str = 'NVFP4'
@@ -70,7 +97,7 @@ MODEL_ARG_FIELDS = [
     'n_expert_groups', 'n_limited_groups', 'route_scale', 'q_lora_rank',
     'kv_lora_rank', 'qk_nope_head_dim', 'qk_rope_head_dim', 'v_head_dim',
     'original_seq_len', 'rope_theta', 'rope_factor', 'beta_fast',
-    'beta_slow', 'mscale', 'attn_type', 'param_dtype', 'kv_cache_dtype',
+    'beta_slow', 'mscale', 'attn_type', 'attn_dtype', 'param_dtype', 'kv_cache_dtype',
     'gemm_dtype'
 ]
 
@@ -288,7 +315,7 @@ def is_gqa_model(args: ModelArgs):
 
 
 def gqa_head_dim(args: ModelArgs):
-    return args.dim / args.n_kv_heads
+    return args.dim // args.n_heads
 
 
 def gqa_kv_cache_dim(args: ModelArgs):
@@ -347,6 +374,21 @@ def get_lowp_flops(gpu: GPU_perf, precision):
     return gpu.get_fp16_flops()
 
 
+def attn_precision(args: ModelArgs):
+    """Return 'MXFP8' if attention QK/ScoreV runs in FP8, else 'BF16' (FP16)."""
+    raw = getattr(args, 'attn_dtype', 'FP16')
+    if str(raw).strip().upper() in ('FP8', 'MXFP8'):
+        return 'MXFP8'
+    return 'BF16'
+
+
+def get_attn_flops(gpu: GPU_perf, args: ModelArgs):
+    """Return the effective TFLOPS for attention QK/ScoreV kernels."""
+    if attn_precision(args) == 'MXFP8':
+        return gpu.get_fp8_flops()
+    return gpu.get_fp16_flops()
+
+
 def uses_native_fp4(gpu: GPU_perf, args: ModelArgs):
     return gemm_precision(args) == 'NVFP4' and gpu.get_fp4_flops() != 0
 
@@ -361,10 +403,10 @@ def gqa_flops(q_len, kv_len, args: ModelArgs, kv_cache_rate):
     v_proj = v_proj * (1 - kv_cache_rate)
     lowp_sum = q_proj + k_proj + v_proj + o_proj
     qk_fp16_sum = args.n_heads * q_len * gqa_head_dim(args) * kv_len
-    score_v_lowp = args.n_heads * q_len * kv_len * args.v_head_dim
+    score_v = args.n_heads * q_len * kv_len * args.v_head_dim
 
-    lowp_flops = (lowp_sum + score_v_lowp) * 2 / 1e9
-    qk_fp16_flops = qk_fp16_sum * 2 / 1e9
+    lowp_flops = lowp_sum * 2 / 1e9
+    qk_fp16_flops = (qk_fp16_sum + score_v) * 2 / 1e9
     return lowp_flops + qk_fp16_flops, lowp_flops, qk_fp16_flops
 
 
@@ -384,9 +426,10 @@ def gqa_elapse_time(args: ModelArgs,
                     decoding_mode=True,
                     batchsize=1,
                     enable_gemm_fp4=True,
-                    min_ar_time=0.015,
-                    gqa_discount=0.7,
-                    gqa_kernel_static_time=0.05,
+                    min_ar_time=ALLREDUCE_LATENCY_MS,
+                    gqa_discount=ATTN_KERNEL_DISCOUNT,
+                    gqa_kernel_static_time=ATTN_KERNEL_STATIC_MS,
+                    cp=1,
                     print_console=False):
     if decoding_mode:
         _, lowp_flops, qk_fp16_flops = gqa_flops(1, seq_len, args, 1)
@@ -396,13 +439,14 @@ def gqa_elapse_time(args: ModelArgs,
         _, lowp_flops, qk_fp16_flops = gqa_flops(seq_len, seq_len, args, kv_cache_rate)
 
     lowp_t = lowp_flops / get_lowp_flops(gpu, gemm_precision(args)) / gqa_discount
-    qk_fp16_t = qk_fp16_flops / gpu.get_fp16_flops() / gqa_discount
+    qk_fp16_t = qk_fp16_flops / get_attn_flops(gpu, args) / gqa_discount / cp
     load_t = gqa_mem(args) / gpu.get_mem_bw()
 
     total = lowp_t + qk_fp16_t + load_t
     if enable_gemm_fp4 and uses_native_fp4(gpu, args):
-        total = lowp_flops / gpu.get_fp4_flops() + qk_fp16_t
+        total = lowp_flops / gpu.get_fp4_flops() + qk_fp16_t + load_t
 
+    ring_comm_t = ring_attention_comm_time(args, gpu, batchsize, cp) if decoding_mode else 0.0
     ar_len = batchsize if decoding_mode else seq_len
     all_reduce_comm_size = ar_len * args.dim * 2 / 1024 / 1024
     all_reduce_t = all_reduce_comm_size / gpu.get_nvlink_bw() + min_ar_time
@@ -410,9 +454,9 @@ def gqa_elapse_time(args: ModelArgs,
     tp_time = {}
     for v in tp:
         if v == 1:
-            tp_time[v] = total + gqa_kernel_static_time
+            tp_time[v] = total + gqa_kernel_static_time + ring_comm_t
         else:
-            tp_time[v] = total / v + all_reduce_t + gqa_kernel_static_time
+            tp_time[v] = total / v + all_reduce_t + gqa_kernel_static_time + ring_comm_t
 
     if print_console:
         print("[%8s]GQA_%s Elapsed time(ms): %.3f" %
@@ -434,6 +478,24 @@ def attn_kv_cache_dim(args: ModelArgs):
     return args.kv_lora_rank + args.qk_rope_head_dim
 
 
+def ring_attention_comm_time(args: ModelArgs, gpu: GPU_perf, batchsize, cp,
+                            tp=1, min_hop_latency=RING_HOP_LATENCY_MS):
+    """Ring attention partial-result reduction time in ms (cp-1 ring steps)."""
+    if cp <= 1:
+        return 0.0
+    if is_gqa_model(args):
+        partial_dim = args.v_head_dim
+        local_heads = args.n_heads // max(tp, 1)
+    else:
+        partial_dim = args.kv_lora_rank
+        local_heads = args.n_heads  # MLA replicates all heads per TP GPU
+    # per head: partial_dim bf16 values + 2 fp32 scalars (max_logit, sum_exp)
+    message_bytes = local_heads * (partial_dim * 2 + 2 * 4) * batchsize
+    ring_steps = cp - 1
+    per_step_ms = message_bytes / (gpu.get_nvlink_bw() * 1024 * 1024 * 1024) * 1000 + min_hop_latency
+    return ring_steps * per_step_ms
+
+
 def decode_kv_cache_storage_multiplier(args: ModelArgs, tp):
     if is_gqa_model(args):
         return 1
@@ -446,14 +508,14 @@ def decode_kv_cache_load_divisor(args: ModelArgs, tp):
     return 1
 
 
-def decode_kv_cache_bytes(args: ModelArgs, seq_len, decode_len, tp):
-    token_num = seq_len + decode_len
+def decode_kv_cache_bytes(args: ModelArgs, seq_len, decode_len, tp, cp=1):
+    token_num = (seq_len + decode_len) / cp
     kv_dim = attn_kv_cache_dim(args)
     return token_num * kv_dim * args.n_layers * decode_kv_cache_storage_multiplier(args, tp) * PRECISION_BYTES_PER_PARAM[kv_cache_precision(args)]
 
 
-def decode_kv_load_time(args: ModelArgs, gpu: GPU_perf, seq_len, batchsize, tp):
-    kv_cache = seq_len * attn_kv_cache_dim(args) * batchsize * PRECISION_BYTES_PER_PARAM[kv_cache_precision(args)]
+def decode_kv_load_time(args: ModelArgs, gpu: GPU_perf, seq_len, batchsize, tp, cp=1):
+    kv_cache = (seq_len / cp) * attn_kv_cache_dim(args) * batchsize * PRECISION_BYTES_PER_PARAM[kv_cache_precision(args)]
     kv_cache = kv_cache / decode_kv_cache_load_divisor(args, tp)
     return kv_cache / 1024 / 1024 / 1024 / gpu.get_mem_bw() * 1000
 
@@ -538,9 +600,10 @@ def mla_elapse_time(args: ModelArgs,
                     decoding_mode=True,
                     batchsize=1,
                     enable_gemm_fp4=True,
-                    min_ar_time=0.015,  # Allreduce的静态延迟
-                    mla_discount=0.7,  # based on FlashMLA result on H800
-                    mla_kernel_static_time=0.05,
+                    min_ar_time=ALLREDUCE_LATENCY_MS,
+                    mla_discount=ATTN_KERNEL_DISCOUNT,
+                    mla_kernel_static_time=ATTN_KERNEL_STATIC_MS,
+                    cp=1,
                     print_console=False):
     if decoding_mode:
         # Decoding时计算为qlen=1, kv_cache_rate = 1
@@ -553,7 +616,7 @@ def mla_elapse_time(args: ModelArgs,
         _, lowp_flops, qk_fp16_flops = mla_flops(
             seq_len, seq_len, args, kv_cache_rate)
     lowp_t = lowp_flops / get_lowp_flops(gpu, gemm_precision(args)) / mla_discount
-    qk_fp16_t = qk_fp16_flops / gpu.get_fp16_flops() / mla_discount
+    qk_fp16_t = qk_fp16_flops / get_attn_flops(gpu, args) / mla_discount / cp
 
     # load weight
     load_t = mla_mem(args) / gpu.get_mem_bw()
@@ -565,8 +628,9 @@ def mla_elapse_time(args: ModelArgs,
             if print_console:
                 print('[%8s]This GPU does not support FP4' % gpu.gpu_type)
         elif uses_native_fp4(gpu, args):
-            total = lowp_flops / gpu.get_fp4_flops() + qk_fp16_t
+            total = lowp_flops / gpu.get_fp4_flops() + qk_fp16_t + load_t
 
+    ring_comm_t = ring_attention_comm_time(args, gpu, batchsize, cp) if decoding_mode else 0.0
     ar_len = batchsize if decoding_mode else seq_len
     all_reduce_comm_size = ar_len * args.dim * 2 / 1024/1024  # fp16 take 2Bytes
     all_reduce_t = all_reduce_comm_size / gpu.get_nvlink_bw() + min_ar_time
@@ -574,9 +638,9 @@ def mla_elapse_time(args: ModelArgs,
     tp_time = {}
     for v in tp:
         if v == 1:
-            tp_time[v] = total + mla_kernel_static_time
+            tp_time[v] = total + mla_kernel_static_time + ring_comm_t
         else:
-            tp_time[v] = total / v + all_reduce_t + mla_kernel_static_time
+            tp_time[v] = total / v + all_reduce_t + mla_kernel_static_time + ring_comm_t
 
     if print_console:
           print("[%8s]%s Elapsed time(ms): %.3f" %
@@ -597,9 +661,10 @@ def decode_attention_component_times(args: ModelArgs,
                                      seq_len,
                                      batchsize,
                                      tp,
-                                     min_ar_time=0.015,
-                                     discount=0.7,
-                                     kernel_static_time=0.05):
+                                     min_ar_time=ALLREDUCE_LATENCY_MS,
+                                     discount=ATTN_KERNEL_DISCOUNT,
+                                     kernel_static_time=ATTN_KERNEL_STATIC_MS,
+                                     cp=1):
     if is_gqa_model(args):
         _, lowp_flops, qk_fp16_flops = gqa_flops(1, seq_len, args, 1)
         weight_load_ms = gqa_mem(args) / gpu.get_mem_bw()
@@ -614,23 +679,24 @@ def decode_attention_component_times(args: ModelArgs,
         lowp_compute_ms = lowp_flops / gpu.get_fp4_flops()
     else:
         lowp_compute_ms = lowp_flops / get_lowp_flops(gpu, gemm_precision(args)) / discount
-    qk_compute_ms = qk_fp16_flops / gpu.get_fp16_flops() / discount
+    qk_compute_ms = qk_fp16_flops / get_attn_flops(gpu, args) / discount / cp
     compute_ms = lowp_compute_ms + qk_compute_ms
+    ring_comm_ms = ring_attention_comm_time(args, gpu, batchsize, cp)
 
-    kv_load_ms = decode_kv_load_time(args, gpu, seq_len, batchsize, tp)
+    kv_load_ms = decode_kv_load_time(args, gpu, seq_len, batchsize, tp, cp=cp)
     all_reduce_comm_size = batchsize * args.dim * 2 / 1024 / 1024
     all_reduce_ms = all_reduce_comm_size / gpu.get_nvlink_bw() + min_ar_time
 
     dense_weight_load_ms = weight_load_ms
     dense_compute_ms = compute_ms
-    dense_overlap_ms = kv_load_ms + max(dense_weight_load_ms, dense_compute_ms)
+    dense_overlap_ms = kv_load_ms + max(dense_weight_load_ms, dense_compute_ms) + ring_comm_ms
 
     sparse_weight_load_ms = weight_load_ms / tp
     if tp == 1:
         sparse_compute_ms = compute_ms + kernel_static_time
     else:
         sparse_compute_ms = compute_ms / tp + all_reduce_ms + kernel_static_time
-    sparse_overlap_ms = kv_load_ms + max(sparse_weight_load_ms, sparse_compute_ms)
+    sparse_overlap_ms = kv_load_ms + max(sparse_weight_load_ms, sparse_compute_ms) + ring_comm_ms
 
     return {
         'KVLoad_ms': kv_load_ms,
@@ -688,15 +754,21 @@ def densmlp_mem(args: ModelArgs):
     return param_mem_mb(3 * args.dim * args.inter_dim, param_precision(args))
 
 
-def _prefill_dense_mlp(args: ModelArgs, gpu: GPU_perf, seq_len, print_console=False):
+def _prefill_dense_mlp(args: ModelArgs, gpu: GPU_perf, seq_len, ffn_tp=1, print_console=False):
     gemm_flops = densmlp_flops(args, seq_len)
     gemm_time = gemm_flops / get_lowp_flops(gpu, gemm_precision(args))
-
     load_time = densmlp_mem(args) / gpu.get_mem_bw()
-    gemm_time = gemm_time + load_time
+    if ffn_tp > 1:
+        gemm_time = gemm_time / ffn_tp
+        load_time = load_time / ffn_tp
+        ar_size = seq_len * args.dim * 2 / 1024 / 1024
+        ar_time = ar_size / gpu.get_nvlink_bw() + ALLREDUCE_LATENCY_MS
+        total = gemm_time + load_time + ar_time
+    else:
+        total = gemm_time + load_time
     if print_console:
-        print("[%8s]Elapsed time(ms): %.3f" % (gpu.gpu_type, gemm_time))
-    return gemm_time
+        print("[%8s]Elapsed time(ms): %.3f" % (gpu.gpu_type, total))
+    return total
 
 
 def prefill_dense_mlp(args: ModelArgs, gpu_dict, seq_len, print_console=False):
@@ -727,7 +799,7 @@ def _prefill_moe(args: ModelArgs, gpu: GPU_perf, seq_len, tp, dp):
 
     num_routed_token = seq_len * dp * args.n_activated_experts / num_device
     routed_flops = moe_expert_flops(args, num_routed_token)
-    expert_num = math.ceil(args.n_routed_experts) / dp / tp
+    expert_num = math.ceil(args.n_routed_experts / (dp * tp))
     routed_time = routed_flops / gemm_flops + load_time * expert_num
 
     return shared_time, routed_time
@@ -751,7 +823,7 @@ def prefill_moe(args: ModelArgs, gpu_dict, seq_len,
     return df
 
 
-def _prefill_alltoall(args: ModelArgs, gpu, seq_len, tp, static_latency=0.05):
+def _prefill_alltoall(args: ModelArgs, gpu, seq_len, tp, static_latency=PREFILL_A2A_LATENCY_MS):
     if gpu.gpu_per_node == 8:
         dp = gpu.gpu_per_node/tp
         dispatch_node = 4
@@ -768,7 +840,7 @@ def _prefill_alltoall(args: ModelArgs, gpu, seq_len, tp, static_latency=0.05):
         comm_bw = gpu.get_nvlink_bw()
 
     combine_size = 2 * dispatch_size  # fp16
-    if gpu.get_fp4_flops != 0:
+    if gpu.get_fp4_flops() != 0:
         dispatch_size = dispatch_size / 2
     dispatch_time = dispatch_size / comm_bw + static_latency
     combine_time = combine_size / comm_bw + static_latency
@@ -864,12 +936,13 @@ def _decoding_batchsize(args: ModelArgs,
                         decode_len,
                         tp,
                         expert_num,
-                        include_ffn_params=True):
-    mem_util_rate = 0.9  # torch/activation等其它开销的折扣
+                        include_ffn_params=True,
+                        cp=1):
+    mem_util_rate = MEM_UTIL_RATE
     attn_param = attn_mem(args)
     expert_mem = moe_expert_mem(args) if include_ffn_params else 0  # expert参数，单位MB
     others_parameter = decode_other_parameter_gb(args, include_ffn_params=include_ffn_params)
-    kv_cache = decode_kv_cache_bytes(args, seq_len, decode_len, tp)
+    kv_cache = decode_kv_cache_bytes(args, seq_len, decode_len, tp, cp=cp)
     mem = gpu.mem * mem_util_rate - others_parameter - attn_param * args.n_layers / tp / 1024
     if include_ffn_params:
         mem -= expert_mem * \
@@ -887,7 +960,7 @@ def decode_ffn_weight_gb(args: ModelArgs):
 
 def min_cabinet_count_for_decode_ffn(args: ModelArgs,
                                      gpu: GPU_perf,
-                                     weight_util_rate=0.95):
+                                     weight_util_rate=WEIGHT_UTIL_RATE):
     cabinet_mem_gb = gpu.mem * gpu.gpu_per_node * weight_util_rate
     return max(1, math.ceil(decode_ffn_weight_gb(args) / cabinet_mem_gb))
 
@@ -895,9 +968,9 @@ def min_cabinet_count_for_decode_ffn(args: ModelArgs,
 def inter_stage_link_time(bs,
                           args: ModelArgs,
                           tp,
-                          link_bw=100,
-                          link_latency=0.005,
-                          max_link_rails=8):
+                          link_bw=CX9_BW_GBS,
+                          link_latency=CX9_LATENCY_MS,
+                          max_link_rails=CX9_MAX_LINK_RAILS):
     activation_mb = bs * args.dim * 2 / 1024 / 1024
     rail_num = max(1, min(tp, max_link_rails))
     effective_bw = link_bw * rail_num
@@ -923,6 +996,7 @@ def decode_mla(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len,
                expert_num=2,
                include_ffn_params=True,
                tp_list=None,
+               cp=1,
                print_console=False):
     df = pd.DataFrame(columns=['GPU', 'BatchSize',
                       'TP', 'LoadKVPerDevice', 'DenseMLA', 'SparseMLA'])
@@ -935,17 +1009,19 @@ def decode_mla(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len,
                                                     tp=tp_list,
                                                     batchsize=bs,
                                                     decoding_mode=True,
-                                                    enable_gemm_fp4=True)
+                                                    enable_gemm_fp4=True,
+                                                    cp=cp)
             for tp_num in tp_list:
                 max_bs = _decoding_batchsize(
                     args, gpu_dict[key], seq_len, decode_len,
                     expert_num=expert_num, tp=tp_num,
-                    include_ffn_params=include_ffn_params)
+                    include_ffn_params=include_ffn_params,
+                    cp=cp)
                 if bs > max_bs:
                     continue
                 else:
                     load_kv_time = decode_kv_load_time(
-                        args, gpu_dict[key], seq_len, bs, tp_num)
+                        args, gpu_dict[key], seq_len, bs, tp_num, cp=cp)
                     df.loc[len(df)] = [gpu_dict[key].gpu_type, bs, tp_num,
                                        load_kv_time, dense_mla, sparse_mla[tp_num]]
     if print_console:
@@ -958,6 +1034,7 @@ def decode_gqa(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len,
                expert_num=2,
                include_ffn_params=True,
                tp_list=None,
+               cp=1,
                print_console=False):
     df = pd.DataFrame(columns=['GPU', 'BatchSize',
                       'TP', 'LoadKVPerDevice', 'DenseMLA', 'SparseMLA'])
@@ -970,16 +1047,18 @@ def decode_gqa(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len,
                                                       tp=tp_list,
                                                       batchsize=bs,
                                                       decoding_mode=True,
-                                                      enable_gemm_fp4=True)
+                                                      enable_gemm_fp4=True,
+                                                      cp=cp)
             for tp_num in tp_list:
                 max_bs = _decoding_batchsize(
                     args, gpu_dict[key], seq_len, decode_len,
                     expert_num=expert_num, tp=tp_num,
-                    include_ffn_params=include_ffn_params)
+                    include_ffn_params=include_ffn_params,
+                    cp=cp)
                 if bs > max_bs:
                     continue
                 load_kv_time = decode_kv_load_time(
-                    args, gpu_dict[key], seq_len, bs, tp_num)
+                    args, gpu_dict[key], seq_len, bs, tp_num, cp=cp)
                 df.loc[len(df)] = [gpu_dict[key].gpu_type, bs, tp_num,
                                    load_kv_time, dense_attn, sparse_attn[tp_num]]
     if print_console:
@@ -997,6 +1076,7 @@ def decode_attention(args: ModelArgs, *func_args, **func_kwargs):
 def decode_dense_mlp(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len,
                      expert_num=2,
                      tp_list=None,
+                     ffn_tp=1,
                      filter_by_max_bs=True,
                      print_console=False):
     if tp_list is None:
@@ -1004,7 +1084,7 @@ def decode_dense_mlp(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len,
     df = pd.DataFrame(columns=['GPU', 'BatchSize', 'TP', 'DenseMLP'])
     for key in gpu_dict.keys():
         for bs in bs_list:
-            t = _prefill_dense_mlp(args, gpu_dict[key], bs)
+            t = _prefill_dense_mlp(args, gpu_dict[key], bs, ffn_tp=ffn_tp)
             for tp_num in tp_list:
                 if filter_by_max_bs:
                     max_bs = _decoding_batchsize(
@@ -1046,7 +1126,7 @@ def groq_flops_discount_table(isa_m=4):
     return table
 
 def _decode_moe_expert(args: ModelArgs, gpu: GPU_perf, bs, 
-                       gemm_group_per_device, device_num):
+                       gemm_group_per_device, device_num, ffn_tp=1):
     load_time = moe_expert_mem(args) / gpu.get_mem_bw()
     if uses_native_fp4(gpu, args):
         load_time = load_time / 2
@@ -1111,11 +1191,16 @@ def _decode_moe_expert(args: ModelArgs, gpu: GPU_perf, bs,
     gpu_flops = gpu_flops * flops_discounts[n_pow2_range(int(m_per_group))]
     
     shared_flops = moe_expert_flops(args, bs)
-    shared_time = shared_flops / gpu_flops + load_time
+    shared_time = shared_flops / gpu_flops / ffn_tp + load_time / ffn_tp
 
     num_routed_token = bs * args.n_activated_experts
     routed_flops = moe_expert_flops(args, num_routed_token)
-    routed_time = routed_flops / gpu_flops + load_time * gemm_group_per_device
+    routed_time = routed_flops / gpu_flops / ffn_tp + load_time * gemm_group_per_device / ffn_tp
+    if ffn_tp > 1:
+        ar_size = bs * args.dim * 2 / 1024 / 1024
+        ar_time = ar_size / gpu.get_nvlink_bw() + ALLREDUCE_LATENCY_MS
+        shared_time += ar_time
+        routed_time += ar_time
     return shared_time, routed_time
 
 
@@ -1123,7 +1208,8 @@ def decode_moe_expert(args: ModelArgs, gpu_dict,
                       bs_list, seq_len, decode_len, 
                       gemm_group_per_device,
                       device_num,
-                      mbs=2, 
+                      mbs=MOE_DECODE_MBS, 
+                      ffn_tp=1,
                       tp_list=None,
                       filter_by_max_bs=True,
                       print_console=False):
@@ -1136,7 +1222,7 @@ def decode_moe_expert(args: ModelArgs, gpu_dict,
             s, r = _decode_moe_expert(
                 args, gpu_dict[gpu_key], bs/mbs, 
                 gemm_group_per_device=gemm_group_per_device, 
-                device_num=device_num)
+                device_num=device_num, ffn_tp=ffn_tp)
             s *= mbs
             r *= mbs
             for tp_num in tp_list:
@@ -1155,7 +1241,7 @@ def decode_moe_expert(args: ModelArgs, gpu_dict,
     return df
 
 
-def _moe_a2a(args: ModelArgs, gpu: GPU_perf, bs, expert_num, device_num, fp8_combine=False, static_latency=0.005, mbs=2):
+def _moe_a2a(args: ModelArgs, gpu: GPU_perf, bs, expert_num, device_num, fp8_combine=False, static_latency=MOE_A2A_LATENCY_MS, mbs=MOE_DECODE_MBS):
     dispatch_size = bs * args.dim * args.n_activated_experts / 1024/1024
     if fp8_combine & (gpu.get_fp4_flops() != 0):  # 支持FP4GPU才能开启FP8 Combine
         combine_size = dispatch_size
@@ -1180,7 +1266,7 @@ def _moe_a2a(args: ModelArgs, gpu: GPU_perf, bs, expert_num, device_num, fp8_com
 def decode_a2a(args: ModelArgs, gpu_dict,
                bs_list, seq_len, decode_len,
                expert_num, device_num,
-               mbs=2,
+               mbs=MOE_DECODE_MBS,
                tp_list=None,
                filter_by_max_bs=True,
                print_console=False, fp8_combine=False):
@@ -1215,8 +1301,9 @@ def _decode_time(args: ModelArgs, gpu,
                  bs_list, seq_len, decode_len,
                  gemm_group_per_device,
                  device_num,
-                 mbs=2,
+                 mbs=MOE_DECODE_MBS,
                  tp_list=None,
+                 ffn_tp=1,
                  fp8_combine=False,
                  print_console=False):
 
@@ -1228,11 +1315,13 @@ def _decode_time(args: ModelArgs, gpu,
     dense_mlp = decode_dense_mlp(
         args, gpu, bs_list, seq_len, decode_len,
         expert_num=expert_per_device,
-        tp_list=tp_list)
+        tp_list=tp_list,
+        ffn_tp=ffn_tp)
     moe = decode_moe_expert(args, gpu, bs_list, seq_len,
                             decode_len, mbs=mbs,
                             gemm_group_per_device=gemm_group_per_device,
                             device_num=device_num,
+                            ffn_tp=ffn_tp,
                             tp_list=tp_list)
     a2a = decode_a2a(args, gpu, bs_list, seq_len, decode_len,
                      expert_num=expert_per_device, device_num=device_num,
@@ -1255,6 +1344,7 @@ def decode_time(args: ModelArgs, gpu_dict,
                 device_num,
                 tps_limit=0,
             tp_list=None,
+                ffn_tp=1,
                 fp8_combine=False,
                 print_console=False):
 
@@ -1262,6 +1352,7 @@ def decode_time(args: ModelArgs, gpu_dict,
                       gemm_group_per_device=gemm_group_per_device,
                       device_num=device_num,
                 tp_list=tp_list,
+                      ffn_tp=ffn_tp,
                       fp8_combine=fp8_combine)
 
     def overlap_adjust(r):
@@ -1349,8 +1440,10 @@ def decode_disaggregated_time(args: ModelArgs,
                               tps_limit=0,
                               tp_list=None,
                               fp8_combine=False,
-                              cx9_bw=100,
-                              cx9_latency=0.005,
+                              cx9_bw=CX9_BW_GBS,
+                              cx9_latency=CX9_LATENCY_MS,
+                              cp=1,
+                              ffn_tp=1,
                               print_console=False):
     if tp_list is None:
         tp_list = [1, 2, 4, 8]
@@ -1360,17 +1453,20 @@ def decode_disaggregated_time(args: ModelArgs,
                            bs_list, seq_len, decode_len,
                            expert_num=expert_per_device,
                            include_ffn_params=False,
-                           tp_list=tp_list)
+                           tp_list=tp_list,
+                           cp=cp)
     dense_mlp = decode_dense_mlp(args, {ffn_gpu.gpu_type: ffn_gpu},
                                  bs_list, seq_len, decode_len,
                                  expert_num=expert_per_device,
                                  tp_list=tp_list,
+                                 ffn_tp=ffn_tp,
                                  filter_by_max_bs=False)
     moe = decode_moe_expert(args, {ffn_gpu.gpu_type: ffn_gpu},
                             bs_list, seq_len, decode_len,
                             gemm_group_per_device=gemm_group_per_device,
                             device_num=device_num,
                     tp_list=tp_list,
+                    ffn_tp=ffn_tp,
                     filter_by_max_bs=False)
     a2a = decode_a2a(args, {ffn_gpu.gpu_type: ffn_gpu},
                      bs_list, seq_len, decode_len,
@@ -1399,7 +1495,8 @@ def decode_disaggregated_time(args: ModelArgs,
     df['Delta'] = df['COMM_SUM'] - df['SparseMLA'] - df['SharedExpert']
     sparse_layers = args.n_layers - args.n_dense_layers
     df['DenseStageCritical'] = np.maximum(df['DenseMLA'], df['DenseMLP'])
-    df['SparseFFNCritical'] = df['SharedExpert'] + df['RoutedExpert'] + np.maximum(df['Delta'], 0)
+    # Disaggregated: attn and FFN on separate machines, no overlap between them
+    df['SparseFFNCritical'] = df['Dispatch'] + df['SharedExpert'] + df['RoutedExpert'] + df['Combine']
     df['SparseStageCritical'] = np.maximum(df['SparseMLA'], df['SparseFFNCritical'])
     df['TPOT_O'] = df['DenseStageCritical'] * args.n_dense_layers
     df['TPOT_O'] += df['SparseStageCritical'] * sparse_layers
@@ -1439,8 +1536,8 @@ def profile_rubin_nvl72_disaggregated(args: ModelArgs,
                                       tp_list=None,
                                       attn_gpu_type='Rubin-NVL72',
                                       ffn_gpu_type='Rubin-NVL72',
-                                      cx9_bw=100,
-                                      cx9_latency=0.005,
+                                      cx9_bw=CX9_BW_GBS,
+                                      cx9_latency=CX9_LATENCY_MS,
                                       fp8_combine=False,
                                       tps_limit=0,
                                       print_console=False):
@@ -1545,7 +1642,7 @@ def profile_rubin_nvl72_disaggregated(args: ModelArgs,
 
 def groq_candidate_device_counts(args: ModelArgs,
                                  ffn_gpu: GPU_perf,
-                                 weight_util_rate=0.9,
+                                 weight_util_rate=WEIGHT_UTIL_RATE,
                                  max_device_num=None):
     min_device_num = max(
         1,
@@ -1580,7 +1677,7 @@ def groq_candidate_device_counts(args: ModelArgs,
 def _disagg_usable_attn_memory_gb(args: ModelArgs,
                                   attn_gpu: GPU_perf,
                                   tp):
-    mem_util_rate = 0.9
+    mem_util_rate = MEM_UTIL_RATE
     attn_param_gb = attn_mem(args) * args.n_layers / tp / 1024
     return mem_util_rate * attn_gpu.mem - decode_other_parameter_gb(args, include_ffn_params=False) - attn_param_gb
 
@@ -1595,7 +1692,8 @@ def build_disaggregated_candidate_rows(args: ModelArgs,
                                        decode_len,
                                        min_device_num,
                                        cx9_bw,
-                                       cx9_latency):
+                                       cx9_latency,
+                                       cp=1):
     if decode_df.empty:
         return decode_df
 
@@ -1619,7 +1717,7 @@ def build_disaggregated_candidate_rows(args: ModelArgs,
         for tp in result_df['TP']
     ]
     result_df['KVCacheGBPerRubinGPU'] = [
-        decode_kv_cache_bytes(args, seq_len, decode_len, tp) * bs / 1024 / 1024 / 1024
+        decode_kv_cache_bytes(args, seq_len, decode_len, tp, cp=cp) * bs / 1024 / 1024 / 1024
         for tp, bs in zip(result_df['TP'], batch_sizes)
     ]
     result_df['KVCacheUtilOnRubin'] = (
@@ -1627,7 +1725,7 @@ def build_disaggregated_candidate_rows(args: ModelArgs,
     )
 
     attn_components = [
-        decode_attention_component_times(args, attn_gpu, seq_len, bs, tp)
+        decode_attention_component_times(args, attn_gpu, seq_len, bs, tp, cp=cp)
         for tp, bs in zip(result_df['TP'], batch_sizes)
     ]
     result_df['AttnKVLoad_ms_per_layer'] = [item['KVLoad_ms'] for item in attn_components]
@@ -1931,9 +2029,11 @@ def generate_groq_rubin72_per_user_results(model_csv='./model.csv',
                                            max_batch_size=32,
                                            max_attn_cabinets=5,
                                            tp_list=None,
-                                           cx9_bw=100,
-                                           cx9_latency=0.005,
-                                           fp8_combine=False):
+                                           cx9_bw=CX9_BW_GBS,
+                                           cx9_latency=CX9_LATENCY_MS,
+                                           fp8_combine=False,
+                                           cp=1,
+                                           ffn_tp=1):
     if model_names is None:
         model_names = []
     if ffn_gpu_types is None:
@@ -1972,6 +2072,8 @@ def generate_groq_rubin72_per_user_results(model_csv='./model.csv',
                     fp8_combine=fp8_combine,
                     cx9_bw=cx9_bw,
                     cx9_latency=cx9_latency,
+                    cp=cp,
+                    ffn_tp=ffn_tp,
                     print_console=False,
                 )
                 if decode_df.empty:
@@ -1989,6 +2091,7 @@ def generate_groq_rubin72_per_user_results(model_csv='./model.csv',
                     min_device_num,
                     cx9_bw,
                     cx9_latency,
+                    cp=cp,
                 )
                 config_candidates.append(candidate_rows)
 
@@ -2091,8 +2194,6 @@ def generate_groq_rubin72_per_user_results(model_csv='./model.csv',
     best_tpot_df.to_csv(best_tpot_path, index=False)
 
     return candidates_df, best_rows_df, feasible_summary_df
-
-
 
 def df_sort(df,value,ascending=False):
     if ascending:
